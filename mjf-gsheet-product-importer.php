@@ -3,7 +3,7 @@
 /**
  * Plugin Name: MJF Google Sheets Product Importer
  * Description: Import and sync WooCommerce products from a Google Sheet.
- * Version: 1.0.0
+ * Version: 2.6.2
  * Author: Siosm
  * Author URI: https://siosm.ch/
  * Text Domain: mjf-gsheet-importer
@@ -16,737 +16,54 @@ if (! defined('ABSPATH')) {
 	exit;
 }
 
+// Load Composer Autoloader
+if (file_exists(dirname(__FILE__) . '/vendor/autoload.php')) {
+	require_once dirname(__FILE__) . '/vendor/autoload.php';
+}
+
+require_once dirname(__FILE__) . '/includes/class-mjf-gsheet-api.php';
+require_once dirname(__FILE__) . '/includes/class-mjf-gsheet-admin.php';
+
 /**
  * Main Plugin Class
  */
 class MJF_GSheet_Product_Importer
 {
-
 	private $option_name = 'mjf_gsheet_importer_settings';
+	private $table_name;
+	public $api;
+	public $admin;
 
 	public function __construct()
 	{
-		add_action('admin_menu', [$this, 'add_admin_menu']);
-		add_action('admin_init', [$this, 'register_settings']);
-		add_action('admin_post_mjf_gsheet_sync', [$this, 'handle_sync_request']);
-		add_action('admin_post_mjf_gsheet_fetch_cols', [$this, 'handle_fetch_cols']);
-		add_action('admin_post_mjf_gsheet_save_mapping', [$this, 'handle_save_mapping']);
-		add_action('admin_post_mjf_gsheet_preview', [$this, 'handle_preview_request']);
-		add_action('admin_post_mjf_gsheet_save_review', [$this, 'handle_save_review_request']);
-		add_action('add_meta_boxes', [$this, 'add_debug_meta_box']);
-		add_filter('plugin_action_links_' . plugin_basename(__FILE__), [$this, 'add_action_links']);
-	}
+		// Force increased memory limit for sync operations (especially with WPML)
+		@ini_set('memory_limit', '1024M');
 
-	/**
-	 * Debug Meta Box
-	 */
-	public function add_debug_meta_box() {
-		add_meta_box('mjf_gsheet_debug', 'MJF Importer Debug', [$this, 'render_debug_meta_box'], 'product', 'normal', 'high');
-	}
+		global $wpdb;
+		$this->table_name = $wpdb->prefix . 'mjf_gsheet_sync_queue';
+		$this->api = new MJF_GSheet_API();
+		$this->admin = new MJF_GSheet_Admin();
 
-	public function render_debug_meta_box($post) {
-		$product = wc_get_product($post->ID);
-		if (! $product) return;
-		
-		echo '<div style="background: #f9f9f9; padding: 15px; border: 1px solid #ddd; max-height: 500px; overflow: auto; font-family: monospace; font-size: 11px; line-height: 1.4;">';
-		echo '<h4>Raw Object (print_r):</h4>';
-		echo '<pre>' . print_r($product, true) . '</pre>';
-		echo '<hr>';
-		echo '<strong style="font-size: 14px; color: #2271b1;">Summary: ' . $product->get_type() . '</strong><hr>';
-		
-		$attrs = $product->get_attributes();
-		echo '<h4>Parent Attributes (_product_attributes):</h4>';
-		if (empty($attrs)) {
-			echo '<span style="color: red;">No attributes found on parent.</span>';
-		} else {
-			foreach ($attrs as $key => $attr) {
-				echo "<div style='margin-bottom: 10px; border-left: 3px solid #ccc; padding-left: 10px;'>";
-				echo "<strong>Key: $key</strong><br>";
-				echo "Type: " . ($attr->is_taxonomy() ? 'Taxonomy ('.$attr->get_name().')' : 'Custom') . "<br>";
-				echo "Variation: " . ($attr->get_variation() ? '<span style="color: green; font-weight: bold;">YES</span>' : '<span style="color: red;">NO</span>') . "<br>";
-				echo "Visible: " . ($attr->get_visible() ? 'YES' : 'NO') . "<br>";
-				echo "Options/Terms: " . json_encode($attr->get_options()) . "";
-				echo "</div>";
-			}
+		if ($wpdb->get_var("SHOW TABLES LIKE '{$this->table_name}'") !== $this->table_name) {
+			self::activate();
 		}
 
-		if ($product->is_type('variable')) {
-			$children = $product->get_children();
-			echo '<h4>Children (Variations):</h4>';
-			if (empty($children)) {
-				echo '<div style="padding: 10px; background: #fee; border: 1px solid #fcc; color: #a00; font-weight: bold;">NO CHILDREN FOUND IN PARENT OBJECT</div>';
-			} else {
-				echo '<ul style="margin: 0; padding-left: 20px;">';
-				foreach ($children as $child_id) {
-					$v = wc_get_product($child_id);
-					if ($v) {
-						$v_attrs = $v->get_attributes();
-						echo '<li style="margin-bottom: 10px; border-bottom: 1px solid #eee; padding-bottom: 5px;">';
-						echo '<strong>ID: ' . $child_id . '</strong> (SKU: ' . $v->get_sku() . ') - Status: ' . $v->get_status() . '<br>';
-						echo 'Price: ' . $v->get_regular_price() . ' | Visible: ' . ($v->variation_is_visible() ? 'YES' : 'NO') . ' | Active: ' . ($v->variation_is_active() ? 'YES' : 'NO') . '<br>';
-						echo '<span style="color: #666;">Meta Attrs (attribute_...):</span><br>';
-						foreach ($v_attrs as $v_key => $v_val) {
-							echo " &nbsp;&nbsp; - <strong>$v_key</strong>: <span style='color: #2271b1;'>$v_val</span><br>";
-						}
-						echo '</li>';
-					} else {
-						echo "<li>ID: $child_id - <span style='color: red;'>COULD NOT LOAD VARIATION OBJECT</span></li>";
-					}
-				}
-				echo '</ul>';
-			}
-		}
-		echo '</div>';
-	}
+		add_action('admin_menu', [$this->admin, 'add_admin_menu']);
+		add_action('admin_init', [$this->admin, 'register_settings']);
 
-	/**
-	 * Add Admin Menu
-	 */
-	public function add_admin_menu()
-	{
-		add_submenu_page(
-			'woocommerce',
-			__('GSheet Importer', 'mjf-gsheet-importer'),
-			__('GSheet Importer', 'mjf-gsheet-importer'),
-			'manage_woocommerce',
-			'mjf-gsheet-importer',
-			[$this, 'render_admin_page']
-		);
-	}
+		// AJAX Endpoints
+		add_action('wp_ajax_mjf_gsheet_generate_comparison', [$this, 'ajax_generate_comparison']);
+		add_action('wp_ajax_mjf_gsheet_get_comparison_page', [$this, 'ajax_get_comparison_page']);
+		add_action('wp_ajax_mjf_gsheet_execute_sync', [$this, 'ajax_execute_sync']);
+		add_action('wp_ajax_mjf_gsheet_update_sync_direction', [$this, 'ajax_update_sync_direction']);
+		add_action('wp_ajax_mjf_gsheet_sync_single_field', [$this, 'ajax_sync_single_field']);
+		add_action('wp_ajax_mjf_gsheet_create_product', [$this, 'ajax_create_product']);
+		add_action('wp_ajax_mjf_gsheet_create_translation', [$this, 'ajax_create_translation']);
 
-	/**
-	 * Add Plugin Action Links
-	 */
-	public function add_action_links($links)
-	{
-		$settings_link = '<a href="' . admin_url('admin.php?page=mjf-gsheet-importer') . '">' . __('Settings', 'mjf-gsheet-importer') . '</a>';
-		array_unshift($links, $settings_link);
-		return $links;
-	}
+		// Order Completed hook for Stock Sync WP -> GS
+		add_action('woocommerce_order_status_completed', [$this, 'sync_stock_to_gsheet_on_order_completed'], 10, 1);
 
-	/**
-	 * Register Settings
-	 */
-	public function register_settings()
-	{
-		register_setting('mjf_gsheet_importer_group', $this->option_name);
-	}
-
-	/**
-	 * Render Admin Page
-	 */
-	public function render_admin_page()
-	{
-		$settings = get_option($this->option_name, []);
-		$sheet_id = $settings['sheet_id'] ?? '';
-		$sheet_name = $settings['sheet_name'] ?? 'Sheet1';
-		$mapping = $settings['mapping'] ?? [];
-		$available_columns = $settings['available_columns'] ?? [];
-		$preview_data = get_option('mjf_gsheet_preview_data', []);
-
-		$current_tab = isset($_GET['tab']) ? $_GET['tab'] : 'connection';
-
-		// Step Locking Logic
-		$step_mapping_ok = ! empty($sheet_id) && ! empty($available_columns);
-		$step_preview_ok = $step_mapping_ok && ! empty($mapping['sku']);
-		$step_import_ok = $step_preview_ok && ! empty($preview_data);
-
-?>
-		<style>
-			.mjf-tabs {
-				margin-top: 20px;
-			}
-
-			.nav-tab-disabled {
-				background: #eee;
-				color: #aaa;
-				cursor: not-allowed !important;
-				opacity: 0.6;
-				pointer-events: none;
-			}
-
-			.mjf-step-card {
-				background: #fff;
-				border: 1px solid #ccd0d4;
-				padding: 25px;
-				margin-top: -1px;
-				min-height: 400px;
-			}
-
-			.mjf-tab-content {
-				display: none;
-			}
-
-			.mjf-tab-content.active {
-				display: block;
-			}
-
-			.mjf-badge {
-				padding: 4px 8px;
-				border-radius: 3px;
-				font-size: 11px;
-				font-weight: bold;
-			}
-
-			.mjf-badge-blue {
-				background: #e7f3ff;
-				color: #2271b1;
-			}
-
-			.mjf-badge-green {
-				background: #edfaef;
-				color: #1a7f37;
-			}
-
-			.variation-list-table {
-				width: 100%;
-				border-collapse: collapse;
-				margin-top: 10px;
-				font-size: 11px;
-			}
-
-			.variation-list-table td,
-			.variation-list-table th {
-				border: 1px solid #eee;
-				padding: 6px;
-				text-align: left;
-			}
-
-			.variation-list-table th {
-				background: #f9f9f9;
-			}
-		</style>
-
-		<div class="wrap">
-			<h1><?php _e('MJF Product Importer', 'mjf-gsheet-importer'); ?></h1>
-
-			<h2 class="nav-tab-wrapper mjf-tabs">
-				<a href="#connection" class="nav-tab <?php echo $current_tab == 'connection' ? 'nav-tab-active' : ''; ?>" data-tab="connection">1. <?php _e('Connection', 'mjf-gsheet-importer'); ?></a>
-
-				<a href="#mapping" class="nav-tab <?php echo $current_tab == 'mapping' ? 'nav-tab-active' : ''; ?> <?php echo !$step_mapping_ok ? 'nav-tab-disabled' : ''; ?>" data-tab="mapping">2. <?php _e('Mapping', 'mjf-gsheet-importer'); ?></a>
-
-				<a href="#preview" class="nav-tab <?php echo $current_tab == 'preview' ? 'nav-tab-active' : ''; ?> <?php echo !$step_preview_ok ? 'nav-tab-disabled' : ''; ?>" data-tab="preview">3. <?php _e('Preview & Review', 'mjf-gsheet-importer'); ?></a>
-
-				<a href="#import" class="nav-tab <?php echo $current_tab == 'import' ? 'nav-tab-active' : ''; ?> <?php echo !$step_import_ok ? 'nav-tab-disabled' : ''; ?>" data-tab="import">4. <?php _e('Final Import', 'mjf-gsheet-importer'); ?></a>
-			</h2>
-
-			<div class="mjf-step-card">
-				<!-- TAB 1: CONNECTION -->
-				<div id="tab-connection" class="mjf-tab-content <?php echo $current_tab == 'connection' ? 'active' : ''; ?>">
-					<form method="post" action="<?php echo admin_url('admin-post.php'); ?>">
-						<input type="hidden" name="action" value="mjf_gsheet_fetch_cols">
-						<?php wp_nonce_field('mjf_gsheet_fetch_cols_action', 'mjf_gsheet_fetch_cols_nonce'); ?>
-						<table class="form-table">
-							<tr>
-								<th scope="row"><label for="sheet_id"><?php _e('Google Sheet ID', 'mjf-gsheet-importer'); ?></label></th>
-								<td>
-									<input name="mjf_gsheet_importer[sheet_id]" type="text" id="sheet_id" value="<?php echo esc_attr($sheet_id); ?>" class="regular-text" placeholder="ex: 11gPM2f-YivsTg8Q6Flkvn8lfleK_5bXrsJi1ZjsHNKI">
-									<p class="description"><?php _e('Found in the URL of your Google Sheet.', 'mjf-gsheet-importer'); ?></p>
-								</td>
-							</tr>
-							<tr>
-								<th scope="row"><label for="sheet_name"><?php _e('Sheet Tab Name', 'mjf-gsheet-importer'); ?></label></th>
-								<td>
-									<input name="mjf_gsheet_importer[sheet_name]" type="text" id="sheet_name" value="<?php echo esc_attr($sheet_name); ?>" class="regular-text">
-								</td>
-							</tr>
-							<tr>
-								<th scope="row"><label for="header_row"><?php _e('Header Row Number', 'mjf-gsheet-importer'); ?></label></th>
-								<td>
-									<input name="mjf_gsheet_importer[header_row]" type="number" id="header_row" value="<?php echo esc_attr($settings['header_row'] ?? 1); ?>" class="small-text">
-								</td>
-							</tr>
-						</table>
-						<?php submit_button(__('Save & Fetch Columns', 'mjf-gsheet-importer'), 'primary large'); ?>
-					</form>
-				</div>
-
-				<!-- TAB 2: MAPPING -->
-				<div id="tab-mapping" class="mjf-tab-content <?php echo $current_tab == 'mapping' ? 'active' : ''; ?>">
-					<?php if ($step_mapping_ok) : ?>
-						<form method="post" action="<?php echo admin_url('admin-post.php'); ?>">
-							<input type="hidden" name="action" value="mjf_gsheet_save_mapping">
-							<?php wp_nonce_field('mjf_gsheet_save_mapping_action', 'mjf_gsheet_save_mapping_nonce'); ?>
-
-							<table class="fixed widefat striped" style="margin-top: 20px;">
-								<thead>
-									<tr>
-										<th><?php _e('WooCommerce Field', 'mjf-gsheet-importer'); ?></th>
-										<th><?php _e('Google Sheet Column', 'mjf-gsheet-importer'); ?></th>
-									</tr>
-								</thead>
-								<tbody>
-									<?php
-									$fields = [
-										'type'              => __('Product Type', 'mjf-gsheet-importer'),
-										'sku'               => __('SKU', 'mjf-gsheet-importer') . ' *',
-										'parent_sku'        => __('Parent SKU', 'mjf-gsheet-importer'),
-										'title'             => __('Title', 'mjf-gsheet-importer'),
-										'description'       => __('Description', 'mjf-gsheet-importer'),
-										'short_description' => __('Short Description', 'mjf-gsheet-importer'),
-										'price'             => __('Price', 'mjf-gsheet-importer'),
-										'stock'             => __('Stock', 'mjf-gsheet-importer'),
-										'weight'            => __('Weight (kg)', 'mjf-gsheet-importer'),
-										'shipping_class'    => __('Shipping Class', 'mjf-gsheet-importer'),
-										'status'            => __('Status (publish/draft)', 'mjf-gsheet-importer'),
-										'cat_primary'       => __('Primary Category', 'mjf-gsheet-importer'),
-										'cat_secondary'     => __('Secondary Category', 'mjf-gsheet-importer'),
-									];
-									foreach ($fields as $key => $label) : ?>
-										<tr>
-											<td><strong><?php echo $label; ?></strong></td>
-											<td>
-												<select name="mapping[<?php echo esc_attr($key); ?>]">
-													<option value="">-- Select --</option>
-													<?php foreach ($available_columns as $col) : ?>
-														<option value="<?php echo esc_attr($col); ?>" <?php selected($mapping[$key] ?? '', $col); ?>><?php echo esc_html($col); ?></option>
-													<?php endforeach; ?>
-												</select>
-											</td>
-										</tr>
-									<?php endforeach; ?>
-								</tbody>
-							</table>
-
-							<h3><?php _e('FedEx Specific Mapping', 'mjf-gsheet-importer'); ?></h3>
-							<table class="fixed widefat striped" style="margin-top: 10px;">
-								<thead>
-									<tr>
-										<th><?php _e('FedEx Field', 'mjf-gsheet-importer'); ?></th>
-										<th><?php _e('Google Sheet Column', 'mjf-gsheet-importer'); ?></th>
-									</tr>
-								</thead>
-								<tbody>
-									<?php
-									$fedex_fields = [
-										'fedex_hs_tariff'       => __('HS Tariff Number', 'mjf-gsheet-importer'),
-										'fedex_description'     => __('Commodity Description', 'mjf-gsheet-importer'),
-										'fedex_freight_class'   => __('Freight Class', 'mjf-gsheet-importer'),
-										'fedex_signature'       => __('Delivery Signature', 'mjf-gsheet-importer'),
-										'fedex_country'         => __('Country of Manufacture', 'mjf-gsheet-importer'),
-										'fedex_custom_value'    => __('Custom Declared Value', 'mjf-gsheet-importer'),
-									];
-									foreach ($fedex_fields as $key => $label) : ?>
-										<tr>
-											<td><strong><?php echo $label; ?></strong></td>
-											<td>
-												<select name="mapping[<?php echo esc_attr($key); ?>]">
-													<option value="">-- Select --</option>
-													<?php foreach ($available_columns as $col) : ?>
-														<option value="<?php echo esc_attr($col); ?>" <?php selected($mapping[$key] ?? '', $col); ?>><?php echo esc_html($col); ?></option>
-													<?php endforeach; ?>
-												</select>
-											</td>
-										</tr>
-									<?php endforeach; ?>
-								</tbody>
-							</table>
-
-							<h3><?php _e('WPML (EN) Translation Mapping', 'mjf-gsheet-importer'); ?></h3>
-							<p class="description"><?php _e('If mapped, the importer will create/update an English translation for each product.', 'mjf-gsheet-importer'); ?></p>
-							<table class="fixed widefat striped" style="margin-top: 10px;">
-								<thead>
-									<tr>
-										<th><?php _e('WPML Field', 'mjf-gsheet-importer'); ?></th>
-										<th><?php _e('Google Sheet Column', 'mjf-gsheet-importer'); ?></th>
-									</tr>
-								</thead>
-								<tbody>
-									<?php
-									$wpml_fields = [
-										'title_en'       => __('Product Name (EN)', 'mjf-gsheet-importer'),
-										'description_en' => __('Description (EN)', 'mjf-gsheet-importer'),
-										'content_en'     => __('Additional Content (EN)', 'mjf-gsheet-importer'),
-									];
-									foreach ($wpml_fields as $key => $label) : ?>
-										<tr>
-											<td><strong><?php echo $label; ?></strong></td>
-											<td>
-												<select name="mapping[<?php echo esc_attr($key); ?>]">
-													<option value="">-- Select --</option>
-													<?php foreach ($available_columns as $col) : ?>
-														<option value="<?php echo esc_attr($col); ?>" <?php selected($mapping[$key] ?? '', $col); ?>><?php echo esc_html($col); ?></option>
-													<?php endforeach; ?>
-												</select>
-											</td>
-										</tr>
-									<?php endforeach; ?>
-								</tbody>
-							</table>
-
-							<h3><?php _e('Product Attributes Mapping', 'mjf-gsheet-importer'); ?></h3>
-							<table class="fixed widefat striped" id="attr-mapping-table" style="margin-top: 10px;">
-								<thead>
-									<tr>
-										<th><?php _e('WC Attribute Name', 'mjf-gsheet-importer'); ?></th>
-										<th><?php _e('Google Sheet Column', 'mjf-gsheet-importer'); ?></th>
-										<th></th>
-									</tr>
-								</thead>
-								<tbody>
-									<?php
-									$attr_mapping = $settings['attr_mapping'] ?? [];
-									if (empty($attr_mapping)) $attr_mapping = ['' => ''];
-									$wc_attributes = wc_get_attribute_taxonomies();
-									foreach ($attr_mapping as $wc_attr => $sheet_col) : ?>
-										<tr class="attr-mapping-row">
-											<td>
-												<select name="attr_mapping_keys_select[]" onchange="if(this.value==='custom') { this.nextElementSibling.style.display='inline-block'; } else { this.nextElementSibling.style.display='none'; this.nextElementSibling.value=''; }" style="width: 100%;">
-													<option value="">-- Select WC Attribute --</option>
-													<?php
-													$is_custom = true;
-													foreach ($wc_attributes as $tax) {
-														$tax_key = 'pa_' . $tax->attribute_name;
-														if ($wc_attr === $tax_key) $is_custom = false;
-														echo '<option value="' . esc_attr($tax_key) . '" ' . selected($wc_attr, $tax_key, false) . '>' . esc_html($tax->attribute_label) . ' (' . $tax_key . ')</option>';
-													}
-													if ($wc_attr === '') $is_custom = false;
-													?>
-													<option value="custom" <?php selected($is_custom, true); ?>>Custom Attribute...</option>
-												</select>
-												<input type="text" name="attr_mapping_keys_custom[]" value="<?php echo $is_custom ? esc_attr($wc_attr) : ''; ?>" placeholder="Custom Attribute Name" style="display: <?php echo $is_custom ? 'inline-block' : 'none'; ?>; margin-top:5px; width:100%;">
-											</td>
-											<td>
-												<select name="attr_mapping_cols[]">
-													<option value="">-- Select --</option>
-													<?php foreach ($available_columns as $col) : ?>
-														<option value="<?php echo esc_attr($col); ?>" <?php selected($sheet_col, $col); ?>><?php echo esc_html($col); ?></option>
-													<?php endforeach; ?>
-												</select>
-											</td>
-											<td><button type="button" class="button remove-row">Remove</button></td>
-										</tr>
-									<?php endforeach; ?>
-								</tbody>
-							</table>
-							<p><button type="button" class="button" id="add-attr-row"><?php _e('Add Attribute', 'mjf-gsheet-importer'); ?></button></p>
-
-							<h3><?php _e('Custom Meta / Fields Mapping', 'mjf-gsheet-importer'); ?></h3>
-							<table class="fixed widefat striped" id="custom-meta-table" style="margin-top: 10px;">
-								<thead>
-									<tr>
-										<th><?php _e('Meta Key', 'mjf-gsheet-importer'); ?></th>
-										<th><?php _e('Google Sheet Column', 'mjf-gsheet-importer'); ?></th>
-										<th></th>
-									</tr>
-								</thead>
-								<tbody>
-									<?php
-									$custom_mapping = $settings['custom_mapping'] ?? [];
-									if (empty($custom_mapping)) $custom_mapping = ['' => ''];
-									foreach ($custom_mapping as $meta_key => $sheet_col) : ?>
-										<tr class="custom-meta-row">
-											<td><input type="text" name="custom_mapping_keys[]" value="<?php echo esc_attr($meta_key); ?>" placeholder="_weight"></td>
-											<td>
-												<select name="custom_mapping_cols[]">
-													<option value="">-- Select --</option>
-													<?php foreach ($available_columns as $col) : ?>
-														<option value="<?php echo esc_attr($col); ?>" <?php selected($sheet_col, $col); ?>><?php echo esc_html($col); ?></option>
-													<?php endforeach; ?>
-												</select>
-											</td>
-											<td><button type="button" class="button remove-row">Remove</button></td>
-										</tr>
-									<?php endforeach; ?>
-								</tbody>
-							</table>
-							<p><button type="button" class="button" id="add-meta-row"><?php _e('Add Custom Meta', 'mjf-gsheet-importer'); ?></button></p>
-							<?php submit_button(__('Save Mapping & Go to Preview', 'mjf-gsheet-importer')); ?>
-						</form>
-					<?php else : ?>
-						<p><?php _e('Please complete step 1 first.', 'mjf-gsheet-importer'); ?></p>
-					<?php endif; ?>
-				</div>
-
-				<!-- TAB 3: PREVIEW -->
-				<div id="tab-preview" class="mjf-tab-content <?php echo $current_tab == 'preview' ? 'active' : ''; ?>">
-					<?php if ($step_preview_ok) : ?>
-						<div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 20px;">
-							<h2><?php _e('Data Analysis & Review', 'mjf-gsheet-importer'); ?></h2>
-							<form method="post" action="<?php echo admin_url('admin-post.php'); ?>">
-								<input type="hidden" name="action" value="mjf_gsheet_preview">
-								<?php wp_nonce_field('mjf_gsheet_preview_action', 'mjf_gsheet_preview_nonce'); ?>
-								<?php submit_button(__('Refresh Analysis', 'mjf-gsheet-importer'), 'secondary'); ?>
-							</form>
-						</div>
-
-						<?php if (empty($preview_data)) : ?>
-							<div class="inline notice notice-warning">
-								<p><?php _e('Please click "Refresh Analysis" to load data.', 'mjf-gsheet-importer'); ?></p>
-							</div>
-						<?php else :
-							$simple_products = $preview_data['simple'] ?? [];
-							$variable_products = $preview_data['variable'] ?? [];
-						?>
-							<form method="post" action="<?php echo admin_url('admin-post.php'); ?>">
-								<input type="hidden" name="action" value="mjf_gsheet_save_review">
-								<?php wp_nonce_field('mjf_gsheet_save_review_action', 'mjf_gsheet_save_review_nonce'); ?>
-
-								<div style="display: flex; gap: 30px; align-items: flex-start;">
-									<div style="flex: 1; border: 1px solid #ddd; padding: 15px; border-radius: 4px; background: #fafafa; max-height: 700px; overflow-y: auto;">
-										<h4 style="position: sticky; top: -15px; background: #fafafa; padding: 10px 0; margin-top: 0; z-index: 10; border-bottom: 1px solid #eee;"><?php _e('Simple Products', 'mjf-gsheet-importer'); ?> <span class="mjf-badge mjf-badge-blue"><?php echo count($simple_products); ?></span></h4>
-										<table class="fixed wp-list-table widefat striped" style="font-size: 11px;">
-											<thead>
-												<tr>
-													<th>SKU</th>
-													<th>Name</th>
-												</tr>
-											</thead>
-											<tbody>
-												<?php foreach ($simple_products as $sku => $prod) : ?>
-													<tr>
-														<td><code><?php echo esc_html($sku); ?></code></td>
-														<td><?php echo esc_html($prod['title']); ?></td>
-													</tr>
-												<?php endforeach; ?>
-											</tbody>
-										</table>
-									</div>
-									<div style="flex: 2; border: 1px solid #ddd; padding: 15px; border-radius: 4px; background: #fafafa; max-height: 700px; overflow-y: auto;">
-										<h4 style="position: sticky; top: -15px; background: #fafafa; padding: 10px 0; margin-top: 0; z-index: 10; border-bottom: 1px solid #eee;"><?php _e('Variable Products', 'mjf-gsheet-importer'); ?> <span class="mjf-badge mjf-badge-green"><?php echo count($variable_products); ?></span></h4>
-										<?php
-										$wc_attributes = wc_get_attribute_taxonomies();
-										$wc_attr_list = [];
-										foreach ($wc_attributes as $tax) {
-											$full_name = 'pa_' . $tax->attribute_name;
-											$wc_attr_list[$tax->attribute_id . '|' . $full_name] = $tax->attribute_label . ' (' . $full_name . ')';
-										}
-										foreach ($variable_products as $v_sku => $v_prod) : ?>
-											<div style="border: 1px solid #ccc; margin-bottom: 25px; background: #fff; padding: 15px; border-radius: 4px;">
-												<div style="display: flex; justify-content: space-between; margin-bottom: 15px; border-bottom: 1px solid #eee; padding-bottom: 10px;">
-													<div><strong><?php echo esc_html($v_prod['title']); ?></strong><br><code>SKU: <?php echo esc_html($v_sku); ?></code></div>
-													<div style="text-align: right;"><span class="mjf-badge mjf-badge-blue"><?php echo count($v_prod['variations']); ?> Variations</span></div>
-												</div>
-												<div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(250px, 1fr)); gap: 15px;">
-													<?php foreach ($v_prod['attributes'] as $attr_name => $attr_vals) :
-														// Auto-detect if it varies
-														$is_variation = count($attr_vals) > 1;
-														$sample_val = implode(', ', $attr_vals);
-														if (strlen($sample_val) > 40) $sample_val = substr($sample_val, 0, 40) . '...';
-													?>
-														<?php 
-														$overrides = get_option('mjf_gsheet_overrides', []);
-														$current_target = $overrides[$v_sku][$attr_name]['target'] ?? '';
-														
-														// 1. Detect if values vary across variations
-														$actually_varies = count($attr_vals) > 1;
-
-														// 2. Smart auto-detection for target matching
-														$has_match = false;
-														$matched_val = '';
-														$display_label = $attr_name;
-														foreach ($wc_attr_list as $val => $label) {
-															list($tid, $tname) = explode('|', $val);
-															if ($tname === $attr_name || $tname === wc_attribute_taxonomy_name($attr_name)) {
-																$has_match = true;
-																$matched_val = $val;
-																// Extract label from "Label (pa_name)"
-																$display_label = preg_replace('/ \(.+\)$/', '', $label);
-																break;
-															}
-														}
-
-														if (empty($current_target) && $has_match) {
-															$current_target = $matched_val;
-														}
-
-														// 3. Default state for checkboxes
-														$is_visible_ov = isset($overrides[$v_sku][$attr_name]['visible']) 
-															? $overrides[$v_sku][$attr_name]['visible'] 
-															: $actually_varies;
-
-														$is_variation_ov = isset($overrides[$v_sku][$attr_name]['variation']) 
-															? $overrides[$v_sku][$attr_name]['variation'] 
-															: $actually_varies;
-														?>
-														<div style="border: 1px solid #eee; padding: 10px; border-radius: 3px; <?php echo !$is_variation_ov ? 'opacity: 0.8; background: #fdfdfd;' : ''; ?>">
-															<div style="display: flex; justify-content: space-between;">
-																<strong><?php echo esc_html($display_label); ?></strong>
-																<span style="font-size: 10px; color: #999;"><?php echo count($attr_vals); ?> values</span>
-															</div>
-															<small style="color: #666;">Source: <?php echo esc_html($sample_val); ?></small>
-															<div style="margin-top: 8px;">
-																<select name="overrides[<?php echo esc_attr($v_sku); ?>][<?php echo esc_attr($attr_name); ?>][target]" style="width: 100%; font-size: 11px;">
-																	<option value=""><?php echo sprintf(__('Default (%s)', 'mjf-gsheet-importer'), $attr_name); ?></option>
-																	<?php foreach ($wc_attr_list as $val => $label) : 
-																		$is_selected = ($current_target === $val);
-																	?>
-																		<option value="<?php echo esc_attr($val); ?>" <?php selected($is_selected, true); ?>><?php echo esc_html($label); ?></option>
-																	<?php endforeach; ?>
-																	<option value="custom:<?php echo esc_attr($attr_name); ?>" <?php selected($current_target, 'custom:' . $attr_name); ?>>Custom Attribute</option>
-																</select>
-															</div>
-															<div style="margin-top: 8px; font-size: 11px;">
-																<label><input type="checkbox" name="overrides[<?php echo esc_attr($v_sku); ?>][<?php echo esc_attr($attr_name); ?>][visible]" <?php checked($is_visible_ov); ?>> Visible</label>
-																<label style="margin-left: 10px;"><input type="checkbox" name="overrides[<?php echo esc_attr($v_sku); ?>][<?php echo esc_attr($attr_name); ?>][variation]" <?php checked($is_variation_ov); ?>> Variations</label>
-															</div>
-														</div>
-													<?php endforeach; ?>
-												</div>
-												<details style="margin-top: 15px;">
-													<summary style="cursor: pointer; color: #2271b1;">View Detail</summary>
-													<table class="variation-list-table">
-														<thead>
-															<tr>
-																<th>SKU</th><?php foreach ($v_prod['attributes'] as $name => $vals) echo "<th>$name</th>"; ?>
-															</tr>
-														</thead>
-														<tbody>
-															<?php foreach ($v_prod['variations'] as $v) : ?>
-																<tr>
-																	<td><code><?php echo esc_html($v['sku']); ?></code></td><?php foreach ($v_prod['attributes'] as $name => $val) echo "<td>" . ($v['attributes'][$name] ?? '-') . "</td>"; ?>
-																</tr>
-															<?php endforeach; ?>
-														</tbody>
-													</table>
-												</details>
-											</div>
-										<?php endforeach; ?>
-									</div>
-								</div>
-								<div style="position: sticky; bottom: 0; background: #f0f0f1; padding: 20px; border-top: 1px solid #ccc; z-index: 100; margin-top: 20px; box-shadow: 0 -5px 15px rgba(0,0,0,0.05); border-radius: 0 0 4px 4px; display: flex; justify-content: center; align-items: center; gap: 20px;">
-									<div style="color: #666; font-size: 13px;">
-										<span class="dashicons dashicons-info" style="font-size: 18px; width: 18px; height: 18px; vertical-align: middle;"></span>
-										<?php _e('Review the mapping above and save to proceed to the final import step.', 'mjf-gsheet-importer'); ?>
-									</div>
-									<?php submit_button(__('Save Review & Go to Import', 'mjf-gsheet-importer'), 'primary large', 'submit', false); ?>
-								</div>
-							</form>
-						<?php endif; ?>
-					<?php else : ?>
-						<p><?php _e('Please complete mapping first.', 'mjf-gsheet-importer'); ?></p>
-					<?php endif; ?>
-				</div>
-
-				<!-- TAB 4: IMPORT -->
-				<div id="tab-import" class="mjf-tab-content <?php echo $current_tab == 'import' ? 'active' : ''; ?>">
-					<?php if ($step_import_ok) : ?>
-						
-						<?php if (isset($_GET['sync_done'])) :
-							$results = get_option('mjf_gsheet_last_sync_results', []);
-						?>
-							<div class="notice notice-success is-dismissible" style="margin-top: 20px; padding: 15px;">
-								<h3>🎉 <?php _e('Import Successful!', 'mjf-gsheet-importer'); ?></h3>
-								<p><?php echo sprintf(__('Processed %d entries.', 'mjf-gsheet-importer'), intval($_GET['sync_done'])); ?></p>
-								
-								<?php if (!empty($results['imported'])) : ?>
-									<h4><?php _e('Imported Products:', 'mjf-gsheet-importer'); ?></h4>
-									<ul style="max-height: 200px; overflow-y: auto; background: #f9f9f9; padding: 10px; border: 1px solid #ddd;">
-										<?php foreach ($results['imported'] as $res) : ?>
-											<li>
-												<strong><?php echo esc_html($res['sku']); ?></strong>: <?php echo esc_html($res['name']); ?> 
-												— <a href="<?php echo esc_url($res['url']); ?>" target="_blank"><?php _e('Edit Product', 'mjf-gsheet-importer'); ?></a>
-											</li>
-										<?php endforeach; ?>
-									</ul>
-								<?php endif; ?>
-							</div>
-						<?php endif; ?>
-
-						<div style="padding: 20px; border: 2px dashed #ddd; background: #fdfdfd; text-align: left;">
-							<h2 style="text-align: center;"><?php _e('Select Products to Import', 'mjf-gsheet-importer'); ?></h2>
-							<form method="post" action="<?php echo admin_url('admin-post.php'); ?>" onsubmit="return confirm('<?php _e('Are you sure you want to run the final import now?', 'mjf-gsheet-importer'); ?>');">
-								<input type="hidden" name="action" value="mjf_gsheet_sync">
-								<?php wp_nonce_field('mjf_gsheet_sync_action', 'mjf_gsheet_nonce'); ?>
-								
-								<p style="text-align: center; color: #666; margin-bottom: 20px;"><?php _e('By default, all products are selected. Uncheck the ones you want to skip. If you only want to test one product, uncheck everything and select only that one.', 'mjf-gsheet-importer'); ?></p>
-								
-								<div style="background: #fff; border: 1px solid #ccd0d4; padding: 15px; margin-bottom: 20px; max-height: 300px; overflow-y: auto;">
-									<label style="font-weight:bold; display:block; margin-bottom: 10px; padding-bottom: 10px; border-bottom: 1px solid #eee;">
-										<input type="checkbox" id="select_all_imports" checked> <?php _e('Select / Deselect All', 'mjf-gsheet-importer'); ?>
-									</label>
-									<?php
-									if (!empty($preview_data['simple'])) {
-										echo '<strong style="display:inline-block; margin-top:10px;">' . __('Simple Products', 'mjf-gsheet-importer') . '</strong><br>';
-										foreach ($preview_data['simple'] as $sku => $item) {
-											echo '<label style="display:block; margin-bottom:5px; margin-left: 10px;"><input type="checkbox" class="import_sku_checkbox" name="import_skus[]" value="' . esc_attr($sku) . '" checked> ' . esc_html($item['title'] ?: $sku) . ' <code style="margin-left: 5px;">SKU: ' . esc_html($sku) . '</code></label>';
-										}
-									}
-									if (!empty($preview_data['variable'])) {
-										echo '<strong style="display:inline-block; margin-top: 15px;">' . __('Variable Products', 'mjf-gsheet-importer') . '</strong><br>';
-										foreach ($preview_data['variable'] as $sku => $item) {
-											$var_count = count($item['variations'] ?? []);
-											echo '<label style="display:block; margin-bottom:5px; margin-left: 10px;"><input type="checkbox" class="import_sku_checkbox" name="import_skus[]" value="' . esc_attr($sku) . '" checked> ' . esc_html($item['title'] ?: $sku) . ' <code style="margin-left: 5px;">SKU: ' . esc_html($sku) . '</code> <small style="color:#666; margin-left: 5px;">('. $var_count .' variations)</small></label>';
-										}
-									}
-									?>
-								</div>
-								<script>
-									document.getElementById('select_all_imports').addEventListener('change', function(e) {
-										var checkboxes = document.querySelectorAll('.import_sku_checkbox');
-										for (var i = 0; i < checkboxes.length; i++) {
-											checkboxes[i].checked = e.target.checked;
-										}
-									});
-								</script>
-
-								<div style="text-align: center;">
-									<?php submit_button(__('Launch Final Synchronization', 'mjf-gsheet-importer'), 'primary large', 'submit', false); ?>
-								</div>
-							</form>
-						</div>
-						<div style="margin-top: 30px;">
-							<h3><?php _e('Logs', 'mjf-gsheet-importer'); ?></h3>
-							<div style="background: #f9f9f9; border: 1px solid #ccc; padding: 10px; max-height: 400px; overflow-y: auto; font-family: monospace;">
-								<?php $logs = get_option('mjf_gsheet_import_logs', []);
-								foreach (array_reverse($logs) as $log) : ?>
-									<div>[<?php echo esc_html($log['time']); ?>] <?php echo esc_html($log['message']); ?></div>
-								<?php endforeach; ?>
-							</div>
-						</div>
-					<?php else : ?>
-						<p><?php _e('Please complete preview first.', 'mjf-gsheet-importer'); ?></p>
-					<?php endif; ?>
-				</div>
-			</div>
-
-			<script>
-				jQuery(document).ready(function($) {
-					$('.mjf-tabs .nav-tab').on('click', function(e) {
-						if ($(this).hasClass('nav-tab-disabled')) return false;
-						e.preventDefault();
-
-						var target = $(this).data('tab');
-
-						// Update Tab UI
-						$('.mjf-tabs .nav-tab').removeClass('nav-tab-active');
-						$(this).addClass('nav-tab-active');
-
-						// Update Content UI
-						$('.mjf-tab-content').removeClass('active');
-						$('#tab-' + target).addClass('active');
-
-						// Update URL hash for better UX
-						window.location.hash = target;
-					});
-
-					// Dynamic Row Management (Attributes & Metas)
-					$('#add-attr-row').on('click', function() {
-						var table = $('#attr-mapping-table tbody');
-						var newRow = table.find('tr:first').clone();
-						newRow.find('input').val('');
-						newRow.find('select').val('');
-						table.append(newRow);
-					});
-
-					$('#add-meta-row').on('click', function() {
-						var table = $('#custom-meta-table tbody');
-						var newRow = table.find('tr:first').clone();
-						newRow.find('input').val('');
-						newRow.find('select').val('');
-						newRow.find('input[type="text"]').hide();
-						table.append(newRow);
-					});
-
-					$(document).on('click', '.remove-row', function() {
-						if ($(this).closest('tbody').find('tr').length > 1) {
-							$(this).closest('tr').remove();
-						}
-					});
-				});
-			</script>
-		</div>
-<?php
+		add_filter('plugin_action_links_' . plugin_basename(__FILE__), [$this->admin, 'add_action_links']);
 	}
 
 	/**
@@ -767,479 +84,24 @@ class MJF_GSheet_Product_Importer
 	}
 
 	/**
-	 * Handle Fetch Columns
-	 */
-	public function handle_fetch_cols()
-	{
-		check_admin_referer('mjf_gsheet_fetch_cols_action', 'mjf_gsheet_fetch_cols_nonce');
-
-		$settings = get_option($this->option_name, []);
-
-		// Save form values first if submitted
-		if (isset($_POST['mjf_gsheet_importer']) && is_array($_POST['mjf_gsheet_importer'])) {
-			$posted = wp_unslash($_POST['mjf_gsheet_importer']);
-			if (isset($posted['sheet_id'])) $settings['sheet_id'] = sanitize_text_field($posted['sheet_id']);
-			if (isset($posted['sheet_name'])) $settings['sheet_name'] = sanitize_text_field($posted['sheet_name']);
-			if (isset($posted['header_row'])) $settings['header_row'] = absint($posted['header_row']);
-			update_option($this->option_name, $settings);
-		}
-
-		$sheet_id = trim($settings['sheet_id'] ?? '');
-
-		// Auto-clean Sheet ID if full URL was pasted
-		if (strpos($sheet_id, 'docs.google.com') !== false) {
-			preg_match('/\/d\/(.*?)(\/|$)/', $sheet_id, $matches);
-			if (! empty($matches[1])) {
-				$sheet_id = $matches[1];
-				$settings['sheet_id'] = $sheet_id;
-				update_option($this->option_name, $settings);
-			}
-		}
-
-		$sheet_name = $settings['sheet_name'] ?? 'Sheet1';
-
-		$sheet_name = $settings['sheet_name'] ?? 'Sheet1';
-
-		// Standard CSV export URL is often more reliable for raw data
-		$csv_url = sprintf(
-			'https://docs.google.com/spreadsheets/d/%s/export?format=csv&sheet=%s',
-			urlencode($sheet_id),
-			urlencode($sheet_name)
-		);
-
-		$response = wp_remote_get($csv_url);
-		if (is_wp_error($response)) {
-			wp_die($response->get_error_message());
-		}
-
-		$body = trim(wp_remote_retrieve_body($response));
-
-		// Detect HTML error page from Google
-		if (strpos($body, '<!DOCTYPE html') !== false || strpos($body, '<html') !== false) {
-			wp_die(__('Error: Google Sheets returned an HTML page instead of data. This usually means the Sheet ID is wrong or the sheet is NOT shared with "Anyone with the link can view".', 'mjf-gsheet-importer'));
-		}
-
-		// Robust CSV Parsing
-		$temp_file = fopen('php://temp', 'r+');
-		fwrite($temp_file, $body);
-		rewind($temp_file);
-
-		$data = [];
-		while (($row = fgetcsv($temp_file)) !== false) {
-			$data[] = $row;
-		}
-		fclose($temp_file);
-
-		if (empty($data)) {
-			wp_die(__('Could not read any data from the sheet.', 'mjf-gsheet-importer'));
-		}
-
-		// DEBUG: Log first 5 rows
-		update_option('mjf_gsheet_import_logs', []);
-		$this->log('--- DEBUG: First 5 rows detected ---');
-		foreach (array_slice($data, 0, 5) as $index => $row) {
-			$row_preview = array_map(function ($c) {
-				return substr(trim($c), 0, 15);
-			}, $row);
-			$this->log(sprintf('Row %d: %s', $index + 1, implode(' | ', $row_preview)));
-		}
-		$this->log('------------------------------------');
-
-		$header_row_index = ((int) ($settings['header_row'] ?? 1)) - 1;
-		if (! isset($data[$header_row_index])) {
-			wp_die(sprintf(__('Header row %d not found in the sheet.', 'mjf-gsheet-importer'), $settings['header_row']));
-		}
-
-		$headers = array_map('trim', $data[$header_row_index]);
-
-		// Fallback for empty headers (happens with merged cells)
-		foreach ($headers as $i => $h) {
-			if (empty($h)) {
-				// Check the row above if it exists (merge detection)
-				if ($header_row_index > 0 && ! empty($data[$header_row_index - 1][$i])) {
-					$headers[$i] = trim($data[$header_row_index - 1][$i]);
-				} else {
-					$headers[$i] = sprintf(__('Column %d (Empty)', 'mjf-gsheet-importer'), $i + 1);
-				}
-			}
-		}
-
-		$settings['available_columns'] = $headers;
-		update_option($this->option_name, $settings);
-
-		wp_redirect(admin_url('admin.php?page=mjf-gsheet-importer&tab=mapping&cols_detected=1#mapping'));
-		exit;
-	}
-
-	/**
-	 * Handle Save Mapping
-	 */
-	public function handle_save_mapping()
-	{
-		check_admin_referer('mjf_gsheet_save_mapping_action', 'mjf_gsheet_save_mapping_nonce');
-
-		$mapping = [];
-		if (isset($_POST['mapping']) && is_array($_POST['mapping'])) {
-			$raw_mapping = wp_unslash($_POST['mapping']);
-			$this->log('Raw POST mapping: ' . print_r($raw_mapping, true));
-			foreach ($raw_mapping as $k => $v) {
-				$mapping[sanitize_text_field($k)] = sanitize_text_field($v);
-			}
-			$this->log('Sanitized mapping: ' . print_r($mapping, true));
-		}
-
-		$custom_keys = isset($_POST['custom_mapping_keys']) ? wp_unslash($_POST['custom_mapping_keys']) : [];
-		$custom_cols = isset($_POST['custom_mapping_cols']) ? wp_unslash($_POST['custom_mapping_cols']) : [];
-
-		$custom_mapping = [];
-		foreach ($custom_keys as $index => $key) {
-			$key = trim($key);
-			$col = $custom_cols[$index] ?? '';
-			if (! empty($key) && ! empty($col)) {
-				$custom_mapping[$key] = $col;
-			}
-		}
-
-		$keys_select = isset($_POST['attr_mapping_keys_select']) ? wp_unslash($_POST['attr_mapping_keys_select']) : [];
-		$keys_custom = isset($_POST['attr_mapping_keys_custom']) ? wp_unslash($_POST['attr_mapping_keys_custom']) : [];
-		$attr_cols = isset($_POST['attr_mapping_cols']) ? wp_unslash($_POST['attr_mapping_cols']) : [];
-
-		$attr_mapping = [];
-		foreach ($attr_cols as $index => $col) {
-			$key = trim($keys_select[$index] ?? '');
-			if ($key === 'custom') {
-				$key = trim($keys_custom[$index] ?? '');
-			}
-			if (! empty($key) && ! empty($col)) {
-				$attr_mapping[$key] = $col;
-			}
-		}
-
-		$settings = get_option($this->option_name, []);
-		$settings['mapping'] = $mapping;
-		$settings['custom_mapping'] = $custom_mapping;
-		$settings['attr_mapping'] = $attr_mapping;
-
-		update_option($this->option_name, $settings);
-
-		wp_redirect(admin_url('admin.php?page=mjf-gsheet-importer&tab=preview&mapping_saved=1#preview'));
-		exit;
-	}
-
-	/**
-	 * Handle Preview Request
-	 */
-	public function handle_preview_request()
-	{
-		check_admin_referer('mjf_gsheet_preview_action', 'mjf_gsheet_preview_nonce');
-
-		$settings = get_option($this->option_name, []);
-		$sheet_id = $settings['sheet_id'] ?? '';
-		$sheet_name = $settings['sheet_name'] ?? 'Sheet1';
-
-		if (empty($sheet_id)) {
-			wp_die(__('Please provide a Google Sheet ID.', 'mjf-gsheet-importer'));
-		}
-
-		$csv_url = sprintf(
-			'https://docs.google.com/spreadsheets/d/%s/export?format=csv&sheet=%s',
-			urlencode($sheet_id),
-			urlencode($sheet_name)
-		);
-
-		$response = wp_remote_get($csv_url);
-		if (is_wp_error($response)) {
-			wp_die($response->get_error_message());
-		}
-
-		$body = trim(wp_remote_retrieve_body($response));
-		if (strpos($body, '<!DOCTYPE html') !== false || strpos($body, '<html') !== false) {
-			wp_die(__('Error: Google Sheets returned an HTML page. Check your Sheet ID and sharing settings.', 'mjf-gsheet-importer'));
-		}
-
-		$temp_file = fopen('php://temp', 'r+');
-		fwrite($temp_file, $body);
-		rewind($temp_file);
-
-		$data = [];
-		while (($row = fgetcsv($temp_file)) !== false) {
-			$data[] = $row;
-		}
-		fclose($temp_file);
-
-		$header_row_index = ((int) ($settings['header_row'] ?? 1)) - 1;
-		$headers = $data[$header_row_index] ?? [];
-		$rows = array_slice($data, $header_row_index + 1);
-
-		$preview_data = [
-			'simple'   => [],
-			'variable' => [],
-		];
-
-		foreach ($rows as $row) {
-			if (count($row) !== count($headers)) continue;
-
-			$raw_item = array_combine($headers, $row);
-			$item = $this->map_item_fields($raw_item);
-			$sku = $item['sku'];
-			$type = strtolower($item['type']); // Case-insensitive type
-			$parent_sku = $item['parent_sku'];
-
-			if (empty($sku) || empty($item['title'])) continue;
-
-			if ($type === 'simple') {
-				$preview_data['simple'][$sku] = $item;
-			} elseif ($type === 'variable') {
-				// Initialize parent attributes as arrays for unique value aggregation
-				if (!empty($item['attributes'])) {
-					foreach ($item['attributes'] as $k => $v) {
-						$item['attributes'][$k] = [$v];
-					}
-				}
-				$item['variations'] = [];
-				$preview_data['variable'][$sku] = $item;
-			} elseif ($type === 'variation' && ! empty($parent_sku)) {
-				if (isset($preview_data['variable'][$parent_sku])) {
-					$preview_data['variable'][$parent_sku]['variations'][] = $item;
-
-					// Aggregate attributes from variation to parent for preview review
-					if (! empty($item['attributes'])) {
-						foreach ($item['attributes'] as $attr_name => $attr_val) {
-							if (! isset($preview_data['variable'][$parent_sku]['attributes'][$attr_name])) {
-								$preview_data['variable'][$parent_sku]['attributes'][$attr_name] = [];
-							} elseif (! is_array($preview_data['variable'][$parent_sku]['attributes'][$attr_name])) {
-								// Fallback just in case
-								$preview_data['variable'][$parent_sku]['attributes'][$attr_name] = [$preview_data['variable'][$parent_sku]['attributes'][$attr_name]];
-							}
-
-							if (! in_array($attr_val, $preview_data['variable'][$parent_sku]['attributes'][$attr_name])) {
-								$preview_data['variable'][$parent_sku]['attributes'][$attr_name][] = $attr_val;
-							}
-						}
-					}
-				} else {
-					// Parent not found yet or not in list
-					$preview_data['simple'][$sku] = $item; // Fallback
-				}
-			}
-		}
-
-		update_option('mjf_gsheet_preview_data', $preview_data);
-		delete_option('mjf_gsheet_overrides'); // Reset overrides on new analysis
-		
-		wp_redirect(admin_url('admin.php?page=mjf-gsheet-importer&tab=preview&preview_done=1#preview'));
-		exit;
-	}
-
-	/**
-	 * Handle Save Review Request
-	 */
-	public function handle_save_review_request()
-	{
-		check_admin_referer('mjf_gsheet_save_review_action', 'mjf_gsheet_save_review_nonce');
-
-		$overrides = $_POST['overrides'] ?? [];
-		update_option('mjf_gsheet_overrides', $overrides);
-
-		wp_redirect(admin_url('admin.php?page=mjf-gsheet-importer&tab=import&review_saved=1#import'));
-		exit;
-	}
-
-	/**
-	 * Handle Sync Request
-	 */
-	public function handle_sync_request()
-	{
-		if (! current_user_can('manage_woocommerce')) {
-			wp_die(__('You do not have sufficient permissions to access this page.', 'mjf-gsheet-importer'));
-		}
-
-		check_admin_referer('mjf_gsheet_sync_action', 'mjf_gsheet_nonce');
-
-		$preview_data = get_option('mjf_gsheet_preview_data', []);
-		$overrides = get_option('mjf_gsheet_overrides', []);
-		$results = [
-			'imported' => [],
-			'errors'   => []
-		];
-
-		if (empty($preview_data)) {
-			wp_die(__('No preview data found. Please run Step 2 first.', 'mjf-gsheet-importer'));
-		}
-
-		update_option('mjf_gsheet_import_logs', []);
-		$this->log(__('Starting final import with manual overrides...', 'mjf-gsheet-importer'));
-
-		// Retrieve selected SKUs
-		$selected_skus = isset($_POST['import_skus']) && is_array($_POST['import_skus']) ? array_map('sanitize_text_field', wp_unslash($_POST['import_skus'])) : [];
-
-		if (empty($selected_skus)) {
-			wp_redirect(admin_url('admin.php?page=mjf-gsheet-importer&tab=import&sync_done=0#import'));
-			exit;
-		}
-
-		$processed_count = 0;
-
-		// Apply Overrides to preview data before processing
-		foreach ($overrides as $sku => $sku_overrides) {
-			if (isset($preview_data['variable'][$sku])) {
-				$preview_data['variable'][$sku]['attr_settings'] = $sku_overrides;
-			}
-		}
-
-		// 1. Process Variable Products Parents
-		foreach ($preview_data['variable'] as $sku => $item) {
-			if (!in_array($sku, $selected_skus)) continue;
-			$product_id = $this->upsert_product($item, 'variable');
-			if ($product_id) {
-				$results['imported'][] = [
-					'sku'  => $sku,
-					'id'   => $product_id,
-					'name' => $item['title'],
-					'url'  => get_edit_post_link($product_id)
-				];
-				$processed_count++;
-
-				// Handle WPML Translation (EN) if fields are mapped
-				if (! empty($item['title_en']) || ! empty($item['description_en']) || ! empty($item['content_en'])) {
-					$this->upsert_translation($product_id, $item, 'en');
-				}
-			}
-		}
-
-		// 2. Process Simple Products
-		foreach ($preview_data['simple'] as $sku => $item) {
-			if (!in_array($sku, $selected_skus)) continue;
-			$product_id = $this->upsert_product($item, 'simple');
-			if ($product_id) {
-				$results['imported'][] = [
-					'sku'  => $sku,
-					'id'   => $product_id,
-					'name' => $item['title'],
-					'url'  => get_edit_post_link($product_id)
-				];
-				$processed_count++;
-
-				// Handle WPML Translation (EN) if fields are mapped
-				if (! empty($item['title_en']) || ! empty($item['description_en']) || ! empty($item['content_en'])) {
-					$this->upsert_translation($product_id, $item, 'en');
-				}
-			}
-		}
-
-		// 3. Process Variations
-		foreach ($preview_data['variable'] as $p_sku => $p_item) {
-			if (!in_array($p_sku, $selected_skus)) continue;
-			
-			foreach ($p_item['variations'] as $v_item) {
-				// Inherit all empty fields from parent
-				$exclude_keys = ['variations', 'sku', 'type', 'parent_sku', 'attributes', 'custom_meta', 'attr_settings', 'description', 'short_description'];
-				foreach ($p_item as $key => $val) {
-					if (in_array($key, $exclude_keys)) continue;
-					if (empty($v_item[$key]) && !empty($val)) {
-						$v_item[$key] = $val;
-					}
-				}
-
-				// Inherit custom meta specifically
-				if (!empty($p_item['custom_meta'])) {
-					if (!isset($v_item['custom_meta'])) $v_item['custom_meta'] = [];
-					foreach ($p_item['custom_meta'] as $mk => $mv) {
-						if (empty($v_item['custom_meta'][$mk]) && !empty($mv)) {
-							$v_item['custom_meta'][$mk] = $mv;
-						}
-					}
-				}
-
-				// Pass parent overrides to variation
-				if (! empty($p_item['attr_settings'])) {
-					$v_item['attr_settings'] = $p_item['attr_settings'];
-				}
-				
-				$this->upsert_variation($v_item);
-				$processed_count++;
-			}
-
-			// Force sync of children list for the parent
-			$p_id = wc_get_product_id_by_sku($p_sku);
-			if ($p_id) {
-				$parent_product = wc_get_product($p_id);
-				if ($parent_product && $parent_product->is_type('variable')) {
-					// 1. Force the data store to refresh children
-					$data_store = $parent_product->get_data_store();
-					$data_store->read_children($parent_product, true);
-					
-					// 2. Save to persist the _children meta and clear transients
-					$parent_product->save();
-					
-					// 3. Clear cache aggressively
-					clean_post_cache($p_id);
-					wc_delete_product_transients($p_id);
-					
-					$this->log(sprintf(__('Aggressive children synchronization for parent SKU: %s', 'mjf-gsheet-importer'), $p_sku));
-				}
-			}
-		}
-
-		update_option('mjf_gsheet_last_sync_results', $results);
-		$this->log(sprintf(__('Final import finished. %d total entries processed.', 'mjf-gsheet-importer'), $processed_count));
-
-		wp_redirect(admin_url('admin.php?page=mjf-gsheet-importer&tab=import&sync_done=' . $processed_count . '#import'));
-		exit;
-	}
-
-	/**
-	 * Map raw CSV item to internal fields using user mapping
-	 */
-	private function map_item_fields($raw)
-	{
-		$settings = get_option($this->option_name, []);
-		$mapping = $settings['mapping'] ?? [];
-		$custom_mapping = $settings['custom_mapping'] ?? [];
-		$attr_mapping = $settings['attr_mapping'] ?? [];
-
-		$mapped = [];
-		foreach ($mapping as $internal => $sheet_col) {
-			$mapped[$internal] = '';
-			if (! empty($sheet_col) && isset($raw[$sheet_col])) {
-				$mapped[$internal] = trim($raw[$sheet_col]);
-			}
-		}
-
-		// Handle Attributes
-		$mapped['attributes'] = [];
-		foreach ($attr_mapping as $attr_name => $sheet_col) {
-			if (! empty($sheet_col) && isset($raw[$sheet_col]) && trim($raw[$sheet_col]) !== '') {
-				$mapped['attributes'][$attr_name] = trim($raw[$sheet_col]);
-			}
-		}
-
-		// Handle Custom Meta
-		$mapped['custom_meta'] = [];
-		foreach ($custom_mapping as $meta_key => $sheet_col) {
-			if (! empty($sheet_col) && isset($raw[$sheet_col])) {
-				$mapped['custom_meta'][$meta_key] = trim($raw[$sheet_col]);
-			}
-		}
-
-		// Default type to simple if empty
-		if (empty($mapped['type'])) {
-			$mapped['type'] = 'simple';
-		}
-		$mapped['type'] = strtolower($mapped['type']);
-
-		return $mapped;
-	}
-
-	/**
 	 * Upsert Simple or Variable Product
 	 */
 	private function upsert_product($item, $type)
 	{
 		$sku = $item['sku'];
-		if (empty($sku)) return;
+		$wp_id = isset($item['wp_id']) ? intval($item['wp_id']) : 0;
+		if (empty($sku) && empty($wp_id)) return;
 
-		$product_id = wc_get_product_id_by_sku($sku);
+		$product_id = 0;
+		if ($wp_id > 0) {
+			$product = wc_get_product($wp_id);
+			if ($product) {
+				$product_id = $wp_id;
+			}
+		}
+		if (!$product_id && !empty($sku)) {
+			$product_id = wc_get_product_id_by_sku($sku);
+		}
 
 		if ($type === 'variable') {
 			$product = $product_id ? wc_get_product($product_id) : new WC_Product_Variable();
@@ -1272,33 +134,10 @@ class MJF_GSheet_Product_Importer
 		if (isset($item['weight']) && $item['weight'] !== '') {
 			$product->set_weight($item['weight']);
 		}
-		
+
 		// Shipping class
-		if (! empty($item['shipping_class'])) {
-			$this->log(sprintf('Attempting to set shipping class "%s" for product %s', $item['shipping_class'], $sku));
-			$term = get_term_by('name', $item['shipping_class'], 'product_shipping_class');
-			if (!$term) {
-				$term = get_term_by('slug', sanitize_title($item['shipping_class']), 'product_shipping_class');
-			}
-			if ($term) {
-				$this->log(sprintf('Found existing shipping class term id %d', $term->term_id));
-				$product->set_shipping_class_id(absint($term->term_id));
-			} else {
-				$this->log(sprintf('Creating new shipping class term %s', $item['shipping_class']));
-				$term_data = wp_insert_term($item['shipping_class'], 'product_shipping_class');
-				if (! is_wp_error($term_data)) {
-					$product->set_shipping_class_id(absint($term_data['term_id']));
-					$this->log(sprintf('Created term id %d', $term_data['term_id']));
-				} else {
-					$this->log('Failed to create term: ' . $term_data->get_error_message());
-					// If it failed because it exists (e.g. cached), try one more time by exact slug
-					if ($term_data->get_error_code() === 'term_exists') {
-						$existing_term_id = $term_data->get_error_data();
-						$product->set_shipping_class_id(absint($existing_term_id));
-						$this->log(sprintf('Recovered existing term id %d', $existing_term_id));
-					}
-				}
-			}
+		if (isset($item['shipping_class'])) {
+			$this->set_product_shipping_class($product, $item['shipping_class']);
 		}
 
 		if (isset($item['price']) && $item['price'] !== '' && $type !== 'variable') {
@@ -1331,9 +170,10 @@ class MJF_GSheet_Product_Importer
 		];
 		foreach ($fedex_map as $item_key => $meta_key) {
 			if (isset($item[$item_key]) && $item[$item_key] !== '') {
-				$product->update_meta_data($meta_key, $item[$item_key]);
+				$normalized = $this->normalize_fedex_select_value($meta_key, $item[$item_key]);
+				$product->update_meta_data($meta_key, $normalized);
 				if ($item_key === 'fedex_country') {
-					$product->update_meta_data('_ph_manufacture_country', $item[$item_key]);
+					$product->update_meta_data('_ph_manufacture_country', $normalized);
 				}
 			}
 		}
@@ -1351,14 +191,19 @@ class MJF_GSheet_Product_Importer
 			}
 		}
 
+		// WCPOS UUID
+		if (! $product->get_meta('_woocommerce_pos_uuid')) {
+			$product->update_meta_data('_woocommerce_pos_uuid', wp_generate_uuid4());
+		}
+
 		$product_id = $product->save();
 		wc_delete_product_transients($product_id);
-		
+
 		// Sync taxonomy terms for global attributes (essential for linking variations)
 		if ($type === 'variable' && ! empty($item['attributes'])) {
 			$product_attributes = $product->get_attributes();
 			foreach ($product_attributes as $attr) {
-				if ($attr->is_taxonomy()) {
+				if ($attr && $attr->is_taxonomy()) {
 					wp_set_object_terms($product_id, $attr->get_options(), $attr->get_name());
 				}
 			}
@@ -1375,9 +220,18 @@ class MJF_GSheet_Product_Importer
 	{
 		$sku = trim($item['sku'] ?? '');
 		$parent_sku = trim($item['parent_sku'] ?? '');
-		if (empty($sku) || empty($parent_sku)) return;
+		$wp_id = isset($item['wp_id']) ? intval($item['wp_id']) : 0;
+		if ((empty($sku) && empty($wp_id)) || empty($parent_sku)) return;
 
-		$parent_id = wc_get_product_id_by_sku($parent_sku);
+		global $wpdb;
+		$parent_id = 0;
+		$parent_row = $wpdb->get_row($wpdb->prepare("SELECT product_id FROM {$this->table_name} WHERE sku = %s", $parent_sku));
+		if ($parent_row && $parent_row->product_id) {
+			$parent_id = intval($parent_row->product_id);
+		}
+		if (!$parent_id) {
+			$parent_id = wc_get_product_id_by_sku($parent_sku);
+		}
 		if (! $parent_id) {
 			$this->log(sprintf(__('Skipped variation %s: Parent SKU %s not found.', 'mjf-gsheet-importer'), $sku, $parent_sku));
 			return;
@@ -1385,8 +239,17 @@ class MJF_GSheet_Product_Importer
 
 		$parent_product = wc_get_product($parent_id);
 
-		$variation_id = wc_get_product_id_by_sku($sku);
-		
+		$variation_id = 0;
+		if ($wp_id > 0) {
+			$variation_product = wc_get_product($wp_id);
+			if ($variation_product) {
+				$variation_id = $wp_id;
+			}
+		}
+		if (!$variation_id && !empty($sku)) {
+			$variation_id = wc_get_product_id_by_sku($sku);
+		}
+
 		$variation = $variation_id ? new WC_Product_Variation($variation_id) : new WC_Product_Variation();
 
 		// Description and Short Description (NOT INHERITED OR SAVED ON VARIATION)
@@ -1397,7 +260,7 @@ class MJF_GSheet_Product_Importer
 
 		// Status: For variations, "Enabled" = "publish".
 		// We force 'publish' to ensure they are linked to the parent product in the admin UI.
-		$variation->set_status('publish'); 
+		$variation->set_status('publish');
 		$this->log(sprintf(__('Forced variation %s status to publish (Enabled)', 'mjf-gsheet-importer'), $sku));
 
 		// Weight
@@ -1406,30 +269,8 @@ class MJF_GSheet_Product_Importer
 		}
 
 		// Shipping class
-		if (! empty($item['shipping_class'])) {
-			$this->log(sprintf('Attempting to set shipping class "%s" for variation %s', $item['shipping_class'], $sku));
-			$term = get_term_by('name', $item['shipping_class'], 'product_shipping_class');
-			if (!$term) {
-				$term = get_term_by('slug', sanitize_title($item['shipping_class']), 'product_shipping_class');
-			}
-			if ($term) {
-				$this->log(sprintf('Found existing shipping class term id %d', $term->term_id));
-				$variation->set_shipping_class_id(absint($term->term_id));
-			} else {
-				$this->log(sprintf('Creating new shipping class term %s', $item['shipping_class']));
-				$term_data = wp_insert_term($item['shipping_class'], 'product_shipping_class');
-				if (! is_wp_error($term_data)) {
-					$variation->set_shipping_class_id(absint($term_data['term_id']));
-					$this->log(sprintf('Created term id %d', $term_data['term_id']));
-				} else {
-					$this->log('Failed to create term: ' . $term_data->get_error_message());
-					if ($term_data->get_error_code() === 'term_exists') {
-						$existing_term_id = $term_data->get_error_data();
-						$variation->set_shipping_class_id(absint($existing_term_id));
-						$this->log(sprintf('Recovered existing term id %d', $existing_term_id));
-					}
-				}
-			}
+		if (isset($item['shipping_class'])) {
+			$this->set_product_shipping_class($variation, $item['shipping_class']);
 		}
 
 		if (isset($item['price']) && $item['price'] !== '') {
@@ -1439,10 +280,11 @@ class MJF_GSheet_Product_Importer
 		if (isset($item['stock']) && $item['stock'] !== '') {
 			$variation->set_manage_stock(true);
 			$variation->set_stock_quantity((int)$item['stock']);
-		} else {
-			$variation->set_manage_stock(false);
+		} elseif (!$variation_id) {
+			$variation->set_manage_stock(true);
+			$variation->set_stock_quantity(0);
 		}
-		
+
 		// FedEx Meta
 		$fedex_map = [
 			'fedex_hs_tariff'       => '_wf_hs_code',
@@ -1454,9 +296,10 @@ class MJF_GSheet_Product_Importer
 		];
 		foreach ($fedex_map as $item_key => $meta_key) {
 			if (isset($item[$item_key]) && $item[$item_key] !== '') {
-				$variation->update_meta_data($meta_key, $item[$item_key]);
+				$normalized = $this->normalize_fedex_select_value($meta_key, $item[$item_key]);
+				$variation->update_meta_data($meta_key, $normalized);
 				if ($item_key === 'fedex_country') {
-					$variation->update_meta_data('_ph_manufacture_country', $item[$item_key]);
+					$variation->update_meta_data('_ph_manufacture_country', $normalized);
 				}
 			}
 		}
@@ -1494,7 +337,7 @@ class MJF_GSheet_Product_Importer
 
 				if ($is_taxonomy) {
 					$attr_key = $display_name;
-					
+
 					// Ensure term exists
 					$term = get_term_by('name', $value, $attr_key);
 					if (!$term) {
@@ -1527,6 +370,16 @@ class MJF_GSheet_Product_Importer
 							$parent_updated = true;
 							$this->log(sprintf(__('Added term "%s" (slug: %s) to parent taxonomy "%s"', 'mjf-gsheet-importer'), $value, $term_slug, $attr_key));
 						}
+					} else {
+						$new_attr = new WC_Product_Attribute();
+						$new_attr->set_id(wc_attribute_taxonomy_id_by_name($attr_key));
+						$new_attr->set_name($attr_key);
+						$new_attr->set_options([$term_id]);
+						$new_attr->set_visible(true);
+						$new_attr->set_variation($attr_key === 'pa_tailles' || $attr_key === 'pa_taille');
+						$parent_attributes[$attr_key] = $new_attr;
+						$parent_updated = true;
+						$this->log(sprintf(__('Initialized parent taxonomy "%s" with term "%s"', 'mjf-gsheet-importer'), $attr_key, $value));
 					}
 				} else {
 					$attr_key = sanitize_title($display_name);
@@ -1551,17 +404,24 @@ class MJF_GSheet_Product_Importer
 			}
 		}
 
-		// Custom Meta
 		if (! empty($item['custom_meta'])) {
 			foreach ($item['custom_meta'] as $meta_key => $meta_value) {
 				$variation->update_meta_data($meta_key, $meta_value);
 			}
 		}
 
-		$variation->save();
+		// WCPOS UUID
+		if (! $variation->get_meta('_woocommerce_pos_uuid')) {
+			$variation->update_meta_data('_woocommerce_pos_uuid', wp_generate_uuid4());
+		}
 
-		// Update title based on attributes (e.g. "Product - XL, Red")
-		$variation_id = $variation->get_id();
+		// Ensure the variation has attributes before creating it
+		if (!$variation_id && empty($variation->get_attributes())) {
+			$this->log(sprintf(__('Skipped variation %s: Cannot create a variation without attributes. Parent product attributes may be missing.', 'mjf-gsheet-importer'), $sku));
+			return;
+		}
+
+		$variation_id = $variation->save();
 		$this->update_variation_title($variation_id);
 
 		// Force update meta after save to ensure variations are linked and identified
@@ -1585,53 +445,90 @@ class MJF_GSheet_Product_Importer
 	 */
 	private function get_category_ids($primary_name, $secondary_name)
 	{
+		global $sitepress;
+		$original_lang = null;
+		if (isset($sitepress)) {
+			$original_lang = $sitepress->get_current_language();
+			$sitepress->switch_lang('fr');
+		}
+
 		$cat_ids = [];
-		$parent_id = 0;
+		$primary_ids = [];
 
 		// 1. Process Primary
 		if (! empty($primary_name)) {
-			$primary_name = trim($primary_name);
-			$term = get_term_by('name', $primary_name, 'product_cat');
-			if (! $term) {
-				$term = wp_insert_term($primary_name, 'product_cat');
-				if (! is_wp_error($term)) {
-					$parent_id = $term['term_id'];
+			$parts = explode(',', $primary_name);
+			foreach ($parts as $part) {
+				$name = trim($part);
+				if (empty($name)) continue;
+
+				$term = get_term_by('name', $name, 'product_cat');
+				$term_id = 0;
+				if (! $term) {
+					$term = wp_insert_term($name, 'product_cat');
+					if (! is_wp_error($term)) {
+						$term_id = $term['term_id'];
+					} elseif (isset($term->error_data['term_exists'])) {
+						$term_id = $term->error_data['term_exists'];
+					}
+				} else {
+					$term_id = $term->term_id;
 				}
-			} else {
-				$parent_id = $term->term_id;
+				if ($term_id) {
+					$primary_ids[] = $term_id;
+					$cat_ids[] = $term_id;
+				}
 			}
-			if ($parent_id) $cat_ids[] = $parent_id;
 		}
+
+		// Use the first primary category as the parent for secondary categories
+		$parent_id = !empty($primary_ids) ? $primary_ids[0] : 0;
 
 		// 2. Process Secondary
-		if (! empty($secondary_name) && $parent_id) {
-			$secondary_name = trim($secondary_name);
-			// Check if child exists under this specific parent
-			$found_term_id = 0;
+		if (! empty($secondary_name)) {
+			$parts = explode(',', $secondary_name);
+			foreach ($parts as $part) {
+				$name = trim($part);
+				if (empty($name)) continue;
 
-			// Search for a term with same name and correct parent
-			$terms = get_terms([
-				'taxonomy'   => 'product_cat',
-				'name'       => $secondary_name,
-				'parent'     => $parent_id,
-				'hide_empty' => false,
-			]);
+				$found_term_id = 0;
 
-			if (! empty($terms) && ! is_wp_error($terms)) {
-				$found_term_id = $terms[0]->term_id;
-			}
+				// 1. Search globally first to see if a category with this name already exists anywhere
+				$global_terms = get_terms([
+					'taxonomy'   => 'product_cat',
+					'name'       => $name,
+					'hide_empty' => false,
+				]);
 
-			if (! $found_term_id) {
-				$term = wp_insert_term($secondary_name, 'product_cat', ['parent' => $parent_id]);
-				if (! is_wp_error($term)) {
-					$found_term_id = $term['term_id'];
+				if (! empty($global_terms) && ! is_wp_error($global_terms)) {
+					$found_term_id = $global_terms[0]->term_id;
+				}
+
+				// 2. If it doesn't exist, create it (under the first primary category if available, otherwise at root)
+				if (! $found_term_id) {
+					$args = [];
+					if ($parent_id) {
+						$args['parent'] = $parent_id;
+					}
+					$term = wp_insert_term($name, 'product_cat', $args);
+					if (! is_wp_error($term)) {
+						$found_term_id = $term['term_id'];
+					} elseif (isset($term->error_data['term_exists'])) {
+						$found_term_id = $term->error_data['term_exists'];
+					}
+				}
+
+				if ($found_term_id) {
+					$cat_ids[] = $found_term_id;
 				}
 			}
-
-			if ($found_term_id) $cat_ids[] = $found_term_id;
 		}
 
-		return $cat_ids;
+		if (isset($sitepress) && $original_lang) {
+			$sitepress->switch_lang($original_lang);
+		}
+
+		return array_values(array_unique(array_map('intval', $cat_ids)));
 	}
 
 	/**
@@ -1684,7 +581,7 @@ class MJF_GSheet_Product_Importer
 						$attr_id = (int)$attr_obj->id;
 					}
 				}
-				
+
 				if ($attr_id > 0) {
 					$attribute->set_id($attr_id);
 					$attribute->set_name($display_name);
@@ -1699,18 +596,38 @@ class MJF_GSheet_Product_Importer
 							break;
 						}
 					}
-					
+
+					if ($attr_id <= 0) {
+						$original_name = isset($settings[$display_name]['original_name']) ? $settings[$display_name]['original_name'] : '';
+						if (empty($original_name) && isset($settings[$name]['original_name'])) {
+							$original_name = $settings[$name]['original_name'];
+						}
+
+						$attr_args = [
+							'name'         => !empty($original_name) ? ucfirst($original_name) : wc_attribute_label($display_name),
+							'slug'         => $clean_name,
+							'type'         => 'select',
+							'order_by'     => 'menu_order',
+							'has_archives' => false,
+						];
+						$new_attr_id = wc_create_attribute($attr_args);
+						if (!is_wp_error($new_attr_id)) {
+							$attr_id = (int)$new_attr_id;
+							register_taxonomy($display_name, apply_filters('woocommerce_taxonomy_objects_' . $display_name, ['product']));
+							$this->log(sprintf(__('Created and set new global attribute "%s" (ID: %d)', 'mjf-gsheet-importer'), $display_name, $attr_id));
+						}
+					}
+
 					if ($attr_id > 0) {
 						$attribute->set_id($attr_id);
 						$attribute->set_name($display_name);
-						$this->log(sprintf(__('Set global attribute "%s" (ID: %d) via fallback', 'mjf-gsheet-importer'), $display_name, $attr_id));
 					} else {
 						$attribute->set_id(0);
 						$attribute->set_name($display_name);
 						$this->log(sprintf(__('Set custom attribute "%s"', 'mjf-gsheet-importer'), $display_name));
 					}
 				}
-				
+
 				// Populate terms
 				$term_ids = [];
 				$options = is_array($values) ? $values : [$values];
@@ -1745,7 +662,8 @@ class MJF_GSheet_Product_Importer
 	/**
 	 * Helper: Update Variation Title
 	 */
-	private function update_variation_title($variation_id) {
+	private function update_variation_title($variation_id)
+	{
 		$variation = wc_get_product($variation_id);
 		if (!$variation) return;
 
@@ -1789,13 +707,13 @@ class MJF_GSheet_Product_Importer
 		if (! $original_product) return;
 
 		$sku = $original_product->get_sku();
-		
+
 		// Find existing translation ID
 		$translated_id = apply_filters('wpml_object_id', $original_id, 'product', false, $lang);
 
 		if (! $translated_id) {
 			$this->log(sprintf(__('Creating new %s translation for product %s', 'mjf-gsheet-importer'), strtoupper($lang), $sku));
-			
+
 			// We create a new product of the same type
 			if ($original_product->is_type('variable')) {
 				$translated_product = new WC_Product_Variable();
@@ -1805,25 +723,44 @@ class MJF_GSheet_Product_Importer
 
 			// Copy base fields that should be synced
 			// We append the language code to the SKU to avoid duplicates in WooCommerce
-			$translated_product->set_sku($sku . '-' . strtoupper($lang)); 
+			$translated_product->set_sku($sku . '-' . strtoupper($lang));
 			$translated_product->set_name($item['title_en'] ?? $original_product->get_name());
 			$translated_product->set_description($item['description_en'] ?? $original_product->get_description());
 			$translated_product->set_short_description($item['content_en'] ?? $original_product->get_short_description());
 			$translated_product->set_status($original_product->get_status());
-			
+
 			// Copy stock and price (unless user wants different prices per language)
 			$translated_product->set_regular_price($original_product->get_regular_price());
 			$translated_product->set_manage_stock($original_product->get_manage_stock());
 			$translated_product->set_stock_quantity($original_product->get_stock_quantity());
 			$translated_product->set_category_ids($original_product->get_category_ids());
-			
-			// Save to get an ID
-			$translated_id = $translated_product->save();
+
+			$wp_shipping_class_id = $original_product->get_shipping_class_id();
+			if ($wp_shipping_class_id) {
+				$translated_class_id = $this->translate_or_create_term($wp_shipping_class_id, 'product_shipping_class', $lang);
+				$translated_product->set_shipping_class_id($translated_class_id);
+			} else {
+				$translated_product->set_shipping_class_id(0);
+			}
+
+			// WCPOS UUID
+			if (! $translated_product->get_meta('_woocommerce_pos_uuid')) {
+				$translated_product->update_meta_data('_woocommerce_pos_uuid', wp_generate_uuid4());
+			}
+
+			// Force attributes for variable translation
+			if ($original_product->is_type('variable')) {
+				$attrs = $original_product->get_attributes();
+				$translated_product->set_attributes($attrs);
+				$translated_id = $translated_product->save();
+			} else {
+				$translated_id = $translated_product->save();
+			}
 
 			// Link to original via WPML
 			$trid = apply_filters('wpml_element_trid', null, $original_id, 'post_product');
 			$default_lang = apply_filters('wpml_default_language', null);
-			
+
 			do_action('wpml_set_element_language_details', [
 				'element_id'           => $translated_id,
 				'element_type'         => 'post_product',
@@ -1832,29 +769,2417 @@ class MJF_GSheet_Product_Importer
 				'source_language_code' => $default_lang
 			]);
 
-			// Force attributes for variable translation
-			if ($original_product->is_type('variable')) {
-				$attrs = $original_product->get_attributes();
-				$translated_product->set_attributes($attrs);
-				$translated_product->save();
-			}
-
+			// Force attributes for variable and simple translation with translated term IDs
+			$this->sync_attributes_to_translation($original_product, $translated_product, $lang);
 		} else {
 			$this->log(sprintf(__('Updating existing %s translation for product %s (ID: %d)', 'mjf-gsheet-importer'), strtoupper($lang), $sku, $translated_id));
 			$translated_product = wc_get_product($translated_id);
 			if (isset($item['title_en'])) $translated_product->set_name($item['title_en']);
 			if (isset($item['description_en'])) $translated_product->set_description($item['description_en']);
 			if (isset($item['content_en'])) $translated_product->set_short_description($item['content_en']);
-			
+
 			// Sync price and stock even on update
 			$translated_product->set_regular_price($original_product->get_regular_price());
 			$translated_product->set_manage_stock($original_product->get_manage_stock());
 			$translated_product->set_stock_quantity($original_product->get_stock_quantity());
-			
+
+			$wp_shipping_class_id = $original_product->get_shipping_class_id();
+			if ($wp_shipping_class_id) {
+				$translated_class_id = $this->translate_or_create_term($wp_shipping_class_id, 'product_shipping_class', $lang);
+				$translated_product->set_shipping_class_id($translated_class_id);
+			} else {
+				$translated_product->set_shipping_class_id(0);
+			}
+
+			// Sync attributes even on update with translated term IDs
+			$this->sync_attributes_to_translation($original_product, $translated_product, $lang);
+
+			// WCPOS UUID
+			if (! $translated_product->get_meta('_woocommerce_pos_uuid')) {
+				$translated_product->update_meta_data('_woocommerce_pos_uuid', wp_generate_uuid4());
+			}
+
 			$translated_product->save();
+		}
+	}
+
+	/**
+	 * Sync attributes from original product to translated product, translating term IDs
+	 */
+	private function sync_attributes_to_translation($original_product, $translated_product, $lang = 'en')
+	{
+		$attrs = $original_product->get_attributes();
+		$translated_attrs = [];
+
+		foreach ($attrs as $key => $attr) {
+			// Handle cases where attribute is returned as a raw array instead of an object
+			if (is_array($attr)) {
+				$attr_obj = new WC_Product_Attribute();
+				$name = isset($attr['name']) ? $attr['name'] : '';
+				$is_taxonomy = isset($attr['is_taxonomy']) ? (bool) $attr['is_taxonomy'] : taxonomy_exists($name);
+
+				$attr_obj->set_id(isset($attr['id']) ? $attr['id'] : 0);
+				$attr_obj->set_name($name);
+
+				if ($is_taxonomy && taxonomy_exists($name)) {
+					$term_ids = wp_get_post_terms($original_product->get_id(), $name, ['fields' => 'ids']);
+					$attr_obj->set_options($term_ids);
+				} else {
+					$value = isset($attr['value']) ? $attr['value'] : '';
+					$attr_obj->set_options(array_filter(array_map('trim', explode('|', $value))));
+				}
+
+				$attr_obj->set_position(isset($attr['position']) ? $attr['position'] : 0);
+				$attr_obj->set_visible(isset($attr['is_visible']) ? (bool) $attr['is_visible'] : true);
+				$attr_obj->set_variation(isset($attr['is_variation']) ? (bool) $attr['is_variation'] : true);
+
+				$attr = $attr_obj;
+			}
+
+			if (!is_object($attr) || !is_a($attr, 'WC_Product_Attribute')) {
+				continue;
+			}
+
+			$translated_attr = clone $attr;
+			if ($attr->is_taxonomy()) {
+				$taxonomy = $attr->get_name();
+				$options = $attr->get_options(); // Array of term IDs
+				$translated_options = [];
+				foreach ($options as $term_id) {
+					$translated_term_id = $this->translate_or_create_term($term_id, $taxonomy, $lang);
+					$translated_options[] = $translated_term_id;
+				}
+				$translated_attr->set_options($translated_options);
+			}
+			$translated_attrs[$key] = $translated_attr;
+		}
+
+		$translated_product->set_attributes($translated_attrs);
+		$translated_product->save();
+
+		// Set object terms on database level to ensure synchronization
+		$translated_id = $translated_product->get_id();
+		foreach ($translated_attrs as $attr) {
+			if ($attr->is_taxonomy()) {
+				wp_set_object_terms($translated_id, $attr->get_options(), $attr->get_name());
+			}
+		}
+	}
+
+	/**
+	 * Retrieve translation of a taxonomy term, or create it in the target language
+	 * if it does not exist, appending '-{$lang}' to the slug and linking it in WPML.
+	 */
+	private function translate_or_create_term($term_id, $taxonomy, $lang = 'en')
+	{
+		// 1. Check if translation already exists
+		$translated_term_id = apply_filters('wpml_object_id', $term_id, $taxonomy, false, $lang);
+		if ($translated_term_id) {
+			return (int) $translated_term_id;
+		}
+
+		global $sitepress;
+		$original_lang = null;
+		if (isset($sitepress)) {
+			$original_lang = $sitepress->get_current_language();
+			// Switch to FR to load the original term
+			$sitepress->switch_lang('fr');
+		}
+
+		// 2. If it does not exist, get original term details
+		$original_term = get_term($term_id, $taxonomy);
+		if (!$original_term || is_wp_error($original_term)) {
+			if (isset($sitepress) && $original_lang) {
+				$sitepress->switch_lang($original_lang);
+			}
+			return (int) $term_id; // Return original if term not found
+		}
+
+		$term_name = $original_term->name;
+		$original_slug = $original_term->slug;
+		$translated_slug = $original_slug . '-' . $lang;
+
+		if (isset($sitepress)) {
+			// Switch to the target language (e.g. 'en') to insert the translation term
+			$sitepress->switch_lang($lang);
+		}
+
+		// 3. Create the translated term
+		$new_term = wp_insert_term($term_name, $taxonomy, [
+			'slug' => $translated_slug
+		]);
+
+		if (is_wp_error($new_term)) {
+			if (isset($new_term->error_data['term_exists'])) {
+				$translated_term_id = $new_term->error_data['term_exists'];
+			} else {
+				if (isset($sitepress) && $original_lang) {
+					$sitepress->switch_lang($original_lang);
+				}
+				return (int) $term_id; // Fallback on failure
+			}
+		} else {
+			$translated_term_id = $new_term['term_id'];
+		}
+
+		// 4. Link the new term to the original term in WPML
+		$trid = apply_filters('wpml_element_trid', null, $term_id, 'tax_' . $taxonomy);
+		if ($trid) {
+			do_action('wpml_set_element_language_details', [
+				'element_id'           => $translated_term_id,
+				'element_type'         => 'tax_' . $taxonomy,
+				'trid'                 => $trid,
+				'language_code'        => $lang,
+				'source_language_code' => 'fr' // Source language is FR
+			]);
+		}
+
+		if (isset($sitepress) && $original_lang) {
+			$sitepress->switch_lang($original_lang);
+		}
+
+		return (int) $translated_term_id;
+	}
+
+	// --------------------------------------------------------
+	// NEW AJAX ENDPOINTS
+	// --------------------------------------------------------
+
+	public function get_hardcoded_mapping()
+	{
+		return [
+			'wp_id' => 'WP ID',
+			'type' => 'Type',
+			'sku' => 'UGS',
+			'parent_sku' => 'UGS Parent',
+			'title' => 'Nom du produit',
+			'description' => 'Contenu additionel FR',
+			'short_description' => 'Description FR',
+			'price' => 'Prix',
+			'stock' => 'Stock',
+			'weight' => 'Poids (kg)',
+			'status' => 'Status',
+			'_wf_hs_code' => 'Numéro de tarif HS',
+			'_ph_commodity_description' => 'Description Fedex',
+			'_wf_freight_class' => 'Classe de fret',
+			'_ph_fedex_signature_option' => 'Signature de livraison',
+			'_ph_manufacture_country' => 'Pays de fabrication',
+			'_wf_manufacture_country' => 'Pays de fabrication',
+			'_wf_fedex_custom_declared_value' => 'Custom Declared Value',
+			'title_en' => 'Nom du produit EN',
+			'description_en' => 'Contenu additionel EN',
+			'content_en' => 'Description EN',
+			'image_slug' => 'Slug Image',
+			'cat_primary' => 'Catégorie principale',
+			'cat_secondary' => 'Catégorie secondaire',
+			'shipping_class' => "Classe d'expédition"
+		];
+	}
+
+	private function compare_item($product_id, $raw_item, $mapping, $type = 'simple', $precalc_attributes = [])
+	{
+		$diff = [];
+		if (!$product_id) {
+			$diff['creation'] = ['gs' => 'New Product', 'wp' => null];
+			return $diff;
+		}
+
+		$product = wc_get_product($product_id);
+		if (!$product) {
+			$diff['creation'] = ['gs' => 'Missing in WP (Deleted)', 'wp' => null];
+			return $diff;
+		}
+
+		global $sitepress;
+		$original_lang = null;
+		if (isset($sitepress)) {
+			$original_lang = $sitepress->get_current_language();
+			$sitepress->switch_lang('fr');
+		}
+
+		$fields_to_compare = [
+			'sku'               => ['get' => 'get_sku', 'type' => 'string'],
+			'title'             => ['get' => 'get_name', 'type' => 'string'],
+			'price'             => ['get' => 'get_regular_price', 'type' => 'float'],
+			// 'stock'             => ['get' => 'get_stock_quantity', 'type' => 'int'], // Excluded to prevent stock warnings and imports on existing products
+			'weight'            => ['get' => 'get_weight', 'type' => 'float'],
+			'description'       => ['get' => 'get_description', 'type' => 'html'],
+			'short_description' => ['get' => 'get_short_description', 'type' => 'html'],
+		];
+
+		if ($type === 'variable') {
+			unset($fields_to_compare['price']);
+			unset($fields_to_compare['stock']);
+		}
+
+		if ($type === 'variation') {
+			// Variations in WC inherit descriptions and don't have unique titles
+			unset($fields_to_compare['title']);
+			unset($fields_to_compare['description']);
+			unset($fields_to_compare['short_description']);
+		}
+
+		foreach ($fields_to_compare as $key => $meta) {
+			$gs_col = $mapping[$key] ?? '';
+			if (empty($gs_col) || !isset($raw_item[$gs_col])) continue;
+
+			$gs_val = $raw_item[$gs_col];
+			$wp_val = $product->{$meta['get']}();
+
+			if ($meta['type'] === 'float') {
+				$gs_val = (float) str_replace(',', '.', $gs_val);
+				$wp_val = (float) $wp_val;
+			} elseif ($meta['type'] === 'int') {
+				$gs_val = (int) $gs_val;
+				$wp_val = (int) $wp_val;
+			} elseif ($meta['type'] === 'html') {
+				if (empty(trim($gs_val)) && empty(trim($wp_val))) continue;
+				// Normalize both sides to plain text before comparing to avoid
+				// false positives from <br> vs \n, entity encoding, whitespace, etc.
+				$gs_plain = $this->normalize_html_for_comparison($gs_val);
+				$wp_plain = $this->normalize_html_for_comparison($wp_val);
+				if ($gs_plain === $wp_plain) continue;
+				$diff[$key] = ['gs' => trim($gs_val), 'wp' => trim($wp_val)];
+				continue;
+			} elseif ($meta['type'] === 'string') {
+				// Normalize spaces and decode entities for robust comparison
+				$gs_val = preg_replace('/\s+/u', ' ', trim(html_entity_decode((string)$gs_val, ENT_QUOTES, 'UTF-8')));
+				$wp_val = preg_replace('/\s+/u', ' ', trim(html_entity_decode((string)$wp_val, ENT_QUOTES, 'UTF-8')));
+			}
+
+			if ($gs_val != $wp_val) {
+				$diff[$key] = ['gs' => $gs_val, 'wp' => $wp_val];
+			}
+		}
+
+		// FedEx & Custom Meta
+		$country_meta_key = ($type === 'variation') ? '_ph_manufacture_country' : '_wf_manufacture_country';
+		$fedex_map = [
+			'_wf_hs_code'                     => $mapping['_wf_hs_code'] ?? 'HS Tariff Number',
+			'_ph_commodity_description'       => $mapping['_ph_commodity_description'] ?? 'Commodity Description',
+			'_wf_freight_class'               => $mapping['_wf_freight_class'] ?? 'Freight Class',
+			'_ph_fedex_signature_option'      => $mapping['_ph_fedex_signature_option'] ?? 'Delivery Signature',
+			$country_meta_key                 => $mapping[$country_meta_key] ?? 'Country of Manufacture',
+			'_wf_fedex_custom_declared_value' => $mapping['_wf_fedex_custom_declared_value'] ?? 'Custom Declared Value',
+		];
+		foreach ($fedex_map as $meta_key => $gs_col) {
+			if (!isset($raw_item[$gs_col])) continue;
+			$gs_val = trim($raw_item[$gs_col]);
+			$wp_val = trim($product->get_meta($meta_key));
+			// Normalize BOTH sides before comparing:
+			// - GS may have "CLASS 125" or "Matinée" (human labels)
+			// - WP may have been stored pre-fix with the same human labels
+			// Both sides are reduced to the canonical constant before diffing.
+			$gs_val_normalized = $this->normalize_fedex_select_value($meta_key, $gs_val);
+			$wp_val_normalized = $this->normalize_fedex_select_value($meta_key, $wp_val);
+			if ($gs_val_normalized !== $wp_val_normalized) {
+				$diff[$meta_key] = ['gs' => $gs_val, 'wp' => $wp_val];
+			}
+		}
+
+		// Shipping class
+		$gs_shipping_class_col = $mapping['shipping_class'] ?? "Classe d'expédition";
+		if (isset($raw_item[$gs_shipping_class_col])) {
+			$gs_shipping_class = trim($raw_item[$gs_shipping_class_col]);
+
+			// Force FR context so get_term returns the canonical FR term name
+			global $sitepress;
+			$_orig_lang_ci = null;
+			if (isset($sitepress)) {
+				$_orig_lang_ci = $sitepress->get_current_language();
+				$sitepress->switch_lang('fr');
+			}
+
+			$wp_shipping_class_id = $product->get_shipping_class_id();
+			$wp_shipping_class_name = '';
+			if ($wp_shipping_class_id) {
+				// Try direct lookup first
+				$term = get_term($wp_shipping_class_id, 'product_shipping_class');
+				if ($term && !is_wp_error($term)) {
+					$wp_shipping_class_name = $term->name;
+				} else {
+					// Fallback: search all WC shipping classes by term_id (handles WPML translated IDs)
+					$classes = WC()->shipping()->get_shipping_classes();
+					foreach ($classes as $sc) {
+						if ((int)$sc->term_id === (int)$wp_shipping_class_id) {
+							$wp_shipping_class_name = $sc->name;
+							break;
+						}
+					}
+				}
+			}
+
+			if (isset($sitepress) && $_orig_lang_ci) {
+				$sitepress->switch_lang($_orig_lang_ci);
+			}
+
+			// Compare by name (case-insensitive, trimmed) — avoids ID mismatch under WPML
+			$match = false;
+			if (empty($gs_shipping_class) && empty($wp_shipping_class_name)) {
+				$match = true;
+			} elseif (!empty($gs_shipping_class) && !empty($wp_shipping_class_name)) {
+				$match = (strcasecmp(trim($gs_shipping_class), trim($wp_shipping_class_name)) === 0);
+			}
+
+			if (!$match) {
+				$diff['shipping_class'] = [
+					'gs' => $gs_shipping_class ?: 'Aucune',
+					'wp' => $wp_shipping_class_name ?: 'Aucune'
+				];
+			}
+		}
+
+		// Categories
+		if ($type !== 'variation') {
+			$primary_names = [];
+			$secondary_names = [];
+
+			$term_ids = $product->get_category_ids();
+			if (!empty($term_ids)) {
+				foreach ($term_ids as $term_id) {
+					$term = get_term($term_id, 'product_cat');
+					if ($term && !is_wp_error($term)) {
+						if ($term->parent == 0) {
+							$primary_names[] = $term->name;
+						} else {
+							$secondary_names[] = $term->name;
+						}
+					}
+				}
+			}
+
+			sort($primary_names);
+			sort($secondary_names);
+
+			$wp_primary = implode(', ', $primary_names);
+			$wp_secondary = implode(', ', $secondary_names);
+
+			$gs_cat_primary_col = $mapping['cat_primary'] ?? 'Catégorie principale';
+			$gs_cat_secondary_col = $mapping['cat_secondary'] ?? 'Catégorie secondaire';
+
+			$gs_primary_raw = isset($raw_item[$gs_cat_primary_col]) ? trim($raw_item[$gs_cat_primary_col]) : '';
+			$gs_secondary_raw = isset($raw_item[$gs_cat_secondary_col]) ? trim($raw_item[$gs_cat_secondary_col]) : '';
+
+			// Helper to normalize and sort comma-separated category lists
+			$normalize_and_sort_cats = function ($cat_str) {
+				if (empty($cat_str)) return '';
+				$parts = explode(',', $cat_str);
+				$cleaned = [];
+				foreach ($parts as $part) {
+					$clean_part = mb_strtolower(preg_replace('/\s+/u', ' ', trim(html_entity_decode($part, ENT_QUOTES, 'UTF-8'))), 'UTF-8');
+					if ($clean_part !== '') {
+						$cleaned[] = $clean_part;
+					}
+				}
+				sort($cleaned);
+				return implode(', ', $cleaned);
+			};
+
+			$gs_primary_norm = $normalize_and_sort_cats($gs_primary_raw);
+			$wp_primary_norm = $normalize_and_sort_cats($wp_primary);
+			if ($gs_primary_norm !== $wp_primary_norm) {
+				$diff['cat_primary'] = ['gs' => $gs_primary_raw, 'wp' => $wp_primary];
+			}
+
+			$gs_secondary_norm = $normalize_and_sort_cats($gs_secondary_raw);
+			$wp_secondary_norm = $normalize_and_sort_cats($wp_secondary);
+			if ($gs_secondary_norm !== $wp_secondary_norm) {
+				$diff['cat_secondary'] = ['gs' => $gs_secondary_raw, 'wp' => $wp_secondary];
+			}
+		}
+
+		// Attributes for variable products
+		if ($type === 'variable') {
+			$sku_col = $mapping['sku'] ?? 'UGS';
+			$parent_sku = trim($raw_item[$sku_col] ?? '');
+
+			// Build structured normalized arrays
+			$gs_norm_attrs = [];
+			if (!empty($parent_sku)) {
+				if (isset($precalc_attributes[$parent_sku])) {
+					$aggregated = [
+						'attributes' => $precalc_attributes[$parent_sku],
+						'attr_settings' => []
+					];
+				} else {
+					$aggregated = $this->aggregate_parent_attributes($parent_sku);
+				}
+				foreach ($aggregated['attributes'] as $tax_name => $vals) {
+					$label = wc_attribute_label($tax_name);
+					$norm_label = $this->normalize_attribute_label($label);
+					if (!empty($vals)) {
+						$norm_vals = array_map([$this, 'normalize_attribute_value'], $vals);
+						sort($norm_vals);
+						$gs_norm_attrs[$norm_label] = $norm_vals;
+					}
+				}
+			}
+
+			$wp_norm_attrs = [];
+			$wp_attributes = $product->get_attributes();
+			foreach ($wp_attributes as $attr) {
+				if (!$attr) continue;
+				if ($attr->is_taxonomy()) {
+					$terms = wc_get_product_terms($product->get_id(), $attr->get_name(), ['fields' => 'names']);
+					if (!is_wp_error($terms) && !empty($terms)) {
+						$label = wc_attribute_label($attr->get_name());
+						$norm_label = $this->normalize_attribute_label($label);
+						$norm_vals = array_map([$this, 'normalize_attribute_value'], $terms);
+						sort($norm_vals);
+						$wp_norm_attrs[$norm_label] = $norm_vals;
+					}
+				} else {
+					$options = $attr->get_options();
+					if (!empty($options)) {
+						$label = $attr->get_name();
+						$norm_label = $this->normalize_attribute_label($label);
+						$norm_vals = array_map([$this, 'normalize_attribute_value'], $options);
+						sort($norm_vals);
+						$wp_norm_attrs[$norm_label] = $norm_vals;
+					}
+				}
+			}
+
+			// Sort by keys
+			ksort($gs_norm_attrs);
+			ksort($wp_norm_attrs);
+
+			// Compare the normalized arrays
+			if ($gs_norm_attrs !== $wp_norm_attrs) {
+				// If they are not equal, compute the display strings to show on the UI (in human format)
+				$gs_attr_texts = [];
+				foreach ($gs_norm_attrs as $norm_label => $vals) {
+					$display_label = $this->get_attribute_display_label($norm_label);
+					$gs_attr_texts[] = $display_label . ': ' . implode(', ', $vals);
+				}
+				$wp_attr_texts = [];
+				foreach ($wp_norm_attrs as $norm_label => $vals) {
+					$display_label = $this->get_attribute_display_label($norm_label);
+					$wp_attr_texts[] = $display_label . ': ' . implode(', ', $vals);
+				}
+				sort($gs_attr_texts);
+				sort($wp_attr_texts);
+
+				$gs_attr_str = implode(' | ', $gs_attr_texts);
+				$wp_attr_str = implode(' | ', $wp_attr_texts);
+
+				$diff['attributes'] = ['gs' => $gs_attr_str ?: 'Aucun', 'wp' => $wp_attr_str ?: 'Aucun'];
+			}
+		}
+
+		// Images
+		$image_slug_col = $mapping['image_slug'] ?? 'Slug Image';
+		if (!empty($raw_item[$image_slug_col])) {
+			$slug = trim($raw_item[$image_slug_col]);
+
+			$expected_main_id = $this->find_attachment_by_base_name($slug . '-main');
+			$wp_main_id = $product->get_image_id();
+
+			if ((int)$expected_main_id !== (int)$wp_main_id && $expected_main_id) {
+				$diff['image_main'] = ['gs' => "Lier: {$slug}-main", 'wp' => $wp_main_id ? "ID: {$wp_main_id}" : "Aucune"];
+			}
+
+			if ($type !== 'variation') {
+				$expected_gallery_ids = [];
+				for ($i = 1; $i <= 25; $i++) {
+					$id = $this->find_attachment_by_base_name($slug . '-' . $i);
+					if ($id) $expected_gallery_ids[] = (int)$id;
+				}
+				$wp_gallery_ids = array_map('intval', $product->get_gallery_image_ids());
+				$expected_sorted = $expected_gallery_ids;
+				sort($expected_sorted);
+				$wp_sorted = $wp_gallery_ids;
+				sort($wp_sorted);
+
+				if ($expected_sorted !== $wp_sorted && !empty($expected_gallery_ids)) {
+					$diff['image_gallery'] = [
+						'gs' => "Lier " . count($expected_gallery_ids) . " images ({$slug}-1...)",
+						'wp' => count($wp_gallery_ids) . " images"
+					];
+				}
+			}
+		}
+
+		if (isset($sitepress) && $original_lang) {
+			$sitepress->switch_lang($original_lang);
+		}
+
+		// WPML EN
+		$post_type_wpml = ($type === 'variation') ? 'product_variation' : 'product';
+		$translated_id = apply_filters('wpml_object_id', $product_id, $post_type_wpml, false, 'en');
+		$wpml_map = [
+			'title_en'       => $mapping['title_en'] ?? 'Nom du produit EN',
+			'description_en' => $mapping['description_en'] ?? 'Contenu additionel EN',
+			'content_en'     => $mapping['content_en'] ?? 'Description EN'
+		];
+
+		if ($type === 'variation') {
+			unset($wpml_map['title_en']);
+			unset($wpml_map['description_en']);
+			unset($wpml_map['content_en']);
+		}
+
+		if (!$translated_id) {
+			// Check if we have at least a Title EN in GS to consider it "missing"
+			$title_en_gs = isset($wpml_map['title_en']) ? trim($raw_item[$wpml_map['title_en']] ?? '') : '';
+			if (!empty($title_en_gs) || $type === 'variation') {
+				$diff['wpml_missing'] = ['gs' => 'Missing EN Translation', 'wp' => null];
+			}
+		} else {
+			$trans_product = wc_get_product($translated_id);
+			if ($trans_product) {
+				foreach ($wpml_map as $field => $col) {
+					if (!isset($raw_item[$col])) continue;
+					$gs_val = trim($raw_item[$col]);
+
+					if ($field === 'title_en') {
+						$wp_val = trim($trans_product->get_name());
+					} elseif ($field === 'description_en') {
+						$wp_val = trim($trans_product->get_description());
+					} else {
+						$wp_val = trim($trans_product->get_short_description());
+					}
+
+					// Normalize for comparison
+					if ($field === 'title_en') {
+						$gs_norm = preg_replace('/\s+/u', ' ', trim(html_entity_decode((string)$gs_val, ENT_QUOTES, 'UTF-8')));
+						$wp_norm = preg_replace('/\s+/u', ' ', trim(html_entity_decode((string)$wp_val, ENT_QUOTES, 'UTF-8')));
+					} else {
+						if (empty(trim($gs_val)) && empty(trim($wp_val))) continue;
+						$gs_norm = $this->normalize_html_for_comparison($gs_val);
+						$wp_norm = $this->normalize_html_for_comparison($wp_val);
+					}
+
+					if ($gs_norm !== $wp_norm) {
+						$diff[$field] = ['gs' => $gs_val, 'wp' => $wp_val];
+					}
+				}
+			}
+		}
+
+		return $diff;
+	}
+
+	public function ajax_generate_comparison()
+	{
+		if (! current_user_can('manage_woocommerce')) wp_send_json_error('Permission denied');
+
+		@ini_set('memory_limit', '512M');
+
+		$data = $this->api->fetch_sheet_data();
+		if (is_wp_error($data)) wp_send_json_error($data->get_error_message());
+
+		global $wpdb;
+		$table_name = $this->table_name;
+		$wpdb->query("TRUNCATE TABLE {$table_name}");
+
+		$settings = get_option($this->option_name, []);
+		$header_row_index = ((int) ($settings['header_row'] ?? 1)) - 1;
+		$headers = array_map('trim', $data[$header_row_index] ?? []);
+		$rows = array_slice($data, $header_row_index + 1);
+
+		$mapping = $this->get_hardcoded_mapping();
+		$inserted = 0;
+		$price_col = $mapping['price'] ?? 'Prix';
+		$sku_col = $mapping['sku'] ?? 'SKU';
+		$type_col = $mapping['type'] ?? 'Type';
+		$parent_sku_col = $mapping['parent_sku'] ?? 'Parent SKU';
+
+		// Pre-pass to collect variable product prices and attributes
+		$parent_prices = [];
+		$precalc_attributes = [];
+		$attr_columns = ['Taille', 'Couleur', 'Modèle', 'Année'];
+
+		foreach ($rows as $row) {
+			if (count($row) !== count($headers)) {
+				$row = count($row) > count($headers) ? array_slice($row, 0, count($headers)) : array_pad($row, count($headers), '');
+			}
+			$raw_item = array_combine($headers, $row);
+			$t = strtolower(trim($raw_item[$type_col] ?? 'simple'));
+			$s = trim($raw_item[$sku_col] ?? '');
+			$parent_sku = trim($raw_item[$parent_sku_col] ?? '');
+			if ($s === '00000000000000') continue;
+
+			if ($t === 'variable' && $s) {
+				$parent_prices[$s] = trim($raw_item[$price_col] ?? '');
+				if (!isset($precalc_attributes[$s])) {
+					$precalc_attributes[$s] = [];
+				}
+			} elseif ($t === 'variation' && $parent_sku) {
+				if (!isset($precalc_attributes[$parent_sku])) {
+					$precalc_attributes[$parent_sku] = [];
+				}
+				foreach ($attr_columns as $col) {
+					$matched_col = null;
+					$val = $this->extract_attribute_from_raw($raw_item, $col, $matched_col);
+					if (!empty($val)) {
+						$tax_name = wc_attribute_taxonomy_name($matched_col);
+						if (!isset($precalc_attributes[$parent_sku][$tax_name])) {
+							$precalc_attributes[$parent_sku][$tax_name] = [];
+						}
+						if (!in_array($val, $precalc_attributes[$parent_sku][$tax_name])) {
+							$precalc_attributes[$parent_sku][$tax_name][] = $val;
+						}
+					}
+				}
+			}
+		}
+
+		foreach ($rows as $index => $row) {
+			if (count($row) !== count($headers)) {
+				if (count($row) > count($headers)) {
+					$row = array_slice($row, 0, count($headers));
+				} else {
+					$row = array_pad($row, count($headers), '');
+				}
+			}
+			$raw_item = array_combine($headers, $row);
+
+			$sku = trim($raw_item[$sku_col] ?? '');
+			if (empty($sku) || $sku === '00000000000000') continue;
+
+			$type = strtolower(trim($raw_item[$type_col] ?? 'simple'));
+			$parent_sku = trim($raw_item[$parent_sku_col] ?? '');
+
+			// Inherit parent price if variation price is empty
+			if ($type === 'variation' && empty(trim($raw_item[$price_col] ?? '')) && !empty($parent_sku) && isset($parent_prices[$parent_sku])) {
+				$raw_item[$price_col] = $parent_prices[$parent_sku];
+			}
+
+			$wp_id_col = $mapping['wp_id'] ?? 'WP ID';
+			$wp_id = isset($raw_item[$wp_id_col]) ? intval(trim($raw_item[$wp_id_col])) : 0;
+
+			$product_id = 0;
+			if ($wp_id > 0) {
+				$product = wc_get_product($wp_id);
+				if ($product) {
+					$product_id = $wp_id;
+				}
+			}
+
+			$gs_row_index = $header_row_index + 1 + $index + 1;
+
+			if (!$product_id && !empty($sku)) {
+				$product_id = wc_get_product_id_by_sku($sku);
+				if ($product_id) {
+					if (!empty($wp_id_col)) {
+						$this->api->write_to_google_sheet($gs_row_index, $wp_id_col, $product_id);
+					}
+					$raw_item[$wp_id_col] = $product_id;
+				}
+			}
+
+			// Automatically update Status in Google Sheets to match WP status (one-way sync WP -> GS)
+			if ($product_id) {
+				$product = wc_get_product($product_id);
+				if ($product) {
+					$status_col = $mapping['status'] ?? 'Status';
+					$gs_status_raw = trim($raw_item[$status_col] ?? '');
+					$gs_status_lower = strtolower($gs_status_raw);
+
+					$gs_status_canonical = 'draft';
+					if (in_array($gs_status_lower, ['publish', 'publié', 'publie', 'active'], true)) {
+						$gs_status_canonical = 'publish';
+					} elseif (in_array($gs_status_lower, ['private', 'privé', 'prive'], true)) {
+						$gs_status_canonical = 'private';
+					} elseif (in_array($gs_status_lower, ['draft', 'brouillon'], true)) {
+						$gs_status_canonical = 'draft';
+					}
+
+					$wp_status_canonical = $product->get_status();
+
+					if ($wp_status_canonical !== $gs_status_canonical) {
+						$wp_status_label = 'Brouillon';
+						if ($wp_status_canonical === 'publish') {
+							$wp_status_label = 'Publié';
+						} elseif ($wp_status_canonical === 'private') {
+							$wp_status_label = 'Privé';
+						}
+
+						$this->api->write_to_google_sheet($gs_row_index, $status_col, $wp_status_label);
+						$raw_item[$status_col] = $wp_status_label;
+					}
+				}
+			}
+
+			$diff = $this->compare_item($product_id, $raw_item, $mapping, $type, $precalc_attributes);
+
+			$status = 'synced';
+			if (isset($diff['creation'])) {
+				$status = 'missing_in_wp';
+			} elseif (isset($diff['wpml_missing'])) {
+				$status = 'translation_missing';
+			} elseif (!empty($diff)) {
+				$status = 'pending';
+			}
+
+			$wpdb->insert($table_name, [
+				'sku' => $sku,
+				'product_id' => $product_id ?: null,
+				'gs_row_index' => $gs_row_index,
+				'status' => $status,
+				'diff_data' => wp_json_encode([
+					'type' => $type,
+					'parent_sku' => $parent_sku,
+					'raw' => $raw_item,
+					'diff' => $diff
+				]),
+				'direction' => 'gs_to_wp'
+			]);
+			$inserted++;
+		}
+
+		error_log("Finished processing. Inserted: $inserted");
+
+		wp_send_json_success(['message' => "Comparison generated successfully. Processed {$inserted} items from the sheet."]);
+	}
+	public function ajax_get_comparison_page()
+	{
+		if (! current_user_can('manage_woocommerce')) wp_send_json_error('Permission denied');
+
+		global $wpdb;
+		$table_name = $this->table_name;
+		$mapping = $this->get_hardcoded_mapping();
+		$title_col = $mapping['title'] ?? 'Title';
+
+		// Fetch all items to group them properly
+		$items = $wpdb->get_results("SELECT * FROM {$table_name} ORDER BY id ASC");
+
+		$grouped = [];
+		foreach ($items as $item) {
+			$diff_data = json_decode($item->diff_data, true);
+			$type = $diff_data['type'] ?? 'simple';
+			$parent_sku = $diff_data['parent_sku'] ?? '';
+			$item->diff_data_decoded = $diff_data;
+
+			if ($type === 'variation' && !empty($parent_sku)) {
+				if (!isset($grouped[$parent_sku])) $grouped[$parent_sku] = ['parent' => null, 'variations' => []];
+				$grouped[$parent_sku]['variations'][] = $item;
+			} else {
+				if (!isset($grouped[$item->sku])) $grouped[$item->sku] = ['parent' => null, 'variations' => []];
+				$grouped[$item->sku]['parent'] = $item;
+			}
+		}
+
+		// Default Sorting Logic: Red/Yellow first, Green last.
+		uasort($grouped, function ($a, $b) {
+			$get_weight = function ($item) {
+				if (!$item) return 99;
+				$status = $item->status;
+				$diff_data = $item->diff_data_decoded ?? [];
+				$diffs = $diff_data['diff'] ?? [];
+				if ($status === 'synced' || $status === 'synced_to_wp' || $status === 'synced_to_gs') return 2; // Green
+				if ($status === 'missing_in_wp') return 0; // Red
+				return 1; // Yellow (Differences or Translation Missing)
+			};
+
+			$get_group_weight = function ($group) use ($get_weight) {
+				$min_weight = $get_weight($group['parent']);
+				if (!empty($group['variations'])) {
+					foreach ($group['variations'] as $var) {
+						$min_weight = min($min_weight, $get_weight($var));
+					}
+				}
+				return $min_weight;
+			};
+
+			$weightA = $get_group_weight($a);
+			$weightB = $get_group_weight($b);
+
+			if ($weightA == $weightB) {
+				$skuA = $a['parent'] ? $a['parent']->sku : '';
+				$skuB = $b['parent'] ? $b['parent']->sku : '';
+				return strcmp($skuA, $skuB);
+			}
+			return $weightA < $weightB ? -1 : 1;
+		});
+
+		$per_page = 100;
+		$total_parents = count($grouped);
+		$total_pages = ceil($total_parents / $per_page);
+		$page = isset($_POST['page']) ? intval($_POST['page']) : 1;
+		$offset = ($page - 1) * $per_page;
+
+		$paged_groups = array_slice($grouped, $offset, $per_page);
+
+		$render_meta_table = function ($item) use ($mapping) {
+			$diff_data = $item->diff_data_decoded;
+			$diffs = $diff_data['diff'] ?? [];
+			$raw = $diff_data['raw'] ?? [];
+			$type = strtolower(trim($diff_data['type'] ?? 'simple'));
+			$is_missing = ($item->status === 'missing_in_wp' || isset($diffs['creation']));
+
+			// Build parent prices lookup for variation price inheritance
+			global $wpdb;
+			$parent_prices_lookup = [];
+			if ($type === 'variation' && !empty($raw[$mapping['parent_sku'] ?? 'UGS Parent'])) {
+				$parent_sku = trim($raw[$mapping['parent_sku'] ?? 'UGS Parent']);
+				$parent_entry = $wpdb->get_row($wpdb->prepare("SELECT diff_data FROM {$this->table_name} WHERE sku = %s", $parent_sku));
+				if ($parent_entry) {
+					$parent_dd = json_decode($parent_entry->diff_data, true);
+					$parent_prices_lookup = $parent_dd['raw'] ?? [];
+				}
+			}
+
+			if ($is_missing) {
+				// Validate fields for product creation
+				$errors = [];
+				// Flexible search helper for validation
+				$get_val = function ($key_or_name) use ($raw, $mapping) {
+					// 1. Try mapping key
+					$col_name = $mapping[$key_or_name] ?? $key_or_name;
+					if (isset($raw[$col_name]) && !empty(trim($raw[$col_name]))) return trim($raw[$col_name]);
+
+					// 2. Try case-insensitive search in raw keys
+					$search = strtolower(trim($col_name));
+					foreach ($raw as $k => $v) {
+						if (strtolower(trim($k)) === $search) return trim($v);
+					}
+					return '';
+				};
+
+				$sku = $get_val('sku');
+				$title = $get_val('title');
+				$gs_type = $get_val('type');
+				$status = $get_val('status');
+				$title_en = $get_val('title_en');
+				$parent_sku = $get_val('parent_sku');
+
+				$price = $get_val('price');
+				if (empty($price) && $type === 'variation' && !empty($parent_prices_lookup)) {
+					$price = trim($parent_prices_lookup[$mapping['price'] ?? 'Prix'] ?? '');
+				}
+				$stock = $get_val('stock');
+
+				// Rule: SKU
+				if (empty($sku) || $sku === '00000000000000') {
+					$errors[] = 'UGS invalide ou manquant.';
+				}
+				// Rule: Title
+				if ($type !== 'variation' && empty($title)) {
+					$errors[] = '"Nom du produit" est vide.';
+				}
+				// Rule: Type
+				if (empty($gs_type)) {
+					$errors[] = '"Type" est vide.';
+				}
+				// Rule: Status
+				if ($type !== 'variation' && empty($status)) {
+					$errors[] = '"Status" est vide.';
+				}
+				// Rule: Nom EN
+				if ($type !== 'variation' && empty($title_en)) {
+					$errors[] = '"Nom du produit EN" est vide.';
+				}
+				// Rule: parent SKU for variations
+				if ($type === 'variation' && empty($parent_sku)) {
+					$errors[] = '"UGS Parent" est obligatoire pour une variation.';
+				}
+				// Rule: parent must exist in WP for variations
+				if ($type === 'variation' && !empty($parent_sku)) {
+					$parent_id = 0;
+					$parent_row = $wpdb->get_row($wpdb->prepare("SELECT product_id FROM {$this->table_name} WHERE sku = %s", $parent_sku));
+					if ($parent_row && $parent_row->product_id) {
+						$parent_id = intval($parent_row->product_id);
+					}
+					if (!$parent_id) {
+						$parent_id = wc_get_product_id_by_sku($parent_sku);
+					}
+					if (!$parent_id || !wc_get_product($parent_id)) {
+						$errors[] = 'Le produit parent (UGS: ' . esc_html($parent_sku) . ') n\'existe pas encore dans WooCommerce.';
+					}
+				}
+				// Rule: price for simple/variation
+				if (in_array($type, ['simple', 'variation']) && empty($price)) {
+					$errors[] = '"Prix" est obligatoire et manquant (y compris chez le parent).';
+				}
+				// Rule: stock for simple
+				if ($type === 'simple' && $stock === '') {
+					$errors[] = '"Stock" est obligatoire pour ce type de produit.';
+				}
+
+				// Flexible check for UGS builder columns
+				$check_group = function ($names) use ($raw) {
+					foreach ($names as $name) {
+						$search = strtolower(trim($name));
+						foreach ($raw as $k => $v) {
+							$key_norm = strtolower(trim($k));
+							if (strpos($key_norm, $search) !== false && !empty(trim($v))) return true;
+						}
+					}
+					return false;
+				};
+
+				// Rule: group 1 - category columns (UGS builder step 1)
+				$cat_group = ['Affiche', 'Textile', 'Accessoire', 'Livre', 'LP', 'CD', 'DVD', 'Multimédia'];
+				if (!$check_group($cat_group)) {
+					$errors[] = 'Constructeur UGS étape 1 : aucune valeur dans Affiche / Textile / Accessoires / Livres / LP-CD-DVD / Multimédia.';
+				}
+
+				// Rule: group 2 - attribute columns (UGS builder step 2)
+				$attr_group = ['Taille', 'Couleur', 'Modèle', 'Année'];
+				if (!$check_group($attr_group)) {
+					$errors[] = 'Constructeur UGS étape 2 : aucune valeur dans Tailles / Couleur / Modèle / Année.';
+				}
+
+				// Render creation panel
+				echo '<div class="mjf-creation-panel" style="padding:15px; border:1px solid #ccd0d4; background:#f9f9f9; margin:0;">';
+				echo '<h4 style="margin:0 0 10px; color:#2271b1;"><span class="dashicons dashicons-warning" style="color:#dc3232;"></span> Produit manquant dans WooCommerce</h4>';
+
+				if (!empty($errors)) {
+					echo '<p style="margin:0 0 8px; font-weight:600; color:#dc3232;">Erreurs de validation — Création impossible :</p>';
+					echo '<ul style="margin:0 0 12px; color:#dc3232; list-style:disc; padding-left:20px;">';
+					foreach ($errors as $err) {
+						echo '<li>' . esc_html($err) . '</li>';
+					}
+					echo '</ul>';
+					echo '<button class="button" disabled>Créer dans WooCommerce</button>';
+				} else {
+					echo '<p style="margin:0 0 12px; color:#46b450;"><span class="dashicons dashicons-yes-alt"></span> Toutes les données requises sont présentes.</p>';
+					echo '<button class="button button-primary mjf-create-product-btn" data-id="' . esc_attr($item->id) . '">';
+					echo '<span class="dashicons dashicons-plus-alt" style="font-size:16px; width:16px; height:16px; line-height:16px; vertical-align:middle; margin-top:-2px;"></span> Créer dans WooCommerce</button>';
+				}
+				echo '</div>';
+				return;
+			}
+
+			if (isset($diffs['wpml_missing'])) {
+				echo '<div class="mjf-translation-panel" style="padding:15px; border:1px solid #ccd0d4; background:#f0f6fb; margin-bottom:15px;">';
+				echo '<h4 style="margin:0 0 10px; color:#2271b1;"><span class="dashicons dashicons-translation" style="color:#2271b1;"></span> Traduction EN manquante</h4>';
+
+				$title_en = trim($raw[$mapping['title_en'] ?? 'Nom du produit EN'] ?? '');
+				if ($type !== 'variation' && empty($title_en)) {
+					echo '<p style="margin:0 0 8px; color:#dc3232; font-weight:600;">Erreur : "Nom du produit EN" est vide dans la Google Sheet. La traduction ne peut pas être créée.</p>';
+				} else {
+					if ($type === 'variation') {
+						echo '<p style="margin:0 0 12px; color:#666;">La variation existe en Français mais sa version Anglaise n\'est pas encore générée par WPML.</p>';
+					} else {
+						echo '<p style="margin:0 0 12px; color:#666;">Le produit existe en Français mais n\'a pas encore de traduction Anglaise dans WooCommerce.</p>';
+					}
+					echo '<button class="button button-primary mjf-create-translation-btn" data-id="' . esc_attr($item->id) . '">';
+					echo '<span class="dashicons dashicons-plus-alt" style="font-size:16px; width:16px; height:16px; line-height:16px; vertical-align:middle; margin-top:-2px;"></span> Créer la traduction Anglaise</button>';
+				}
+				echo '</div>';
+				unset($diffs['wpml_missing']);
+			}
+
+			if (empty($diffs)) {
+				echo '<div style="padding:10px; color:#666; font-style:italic;">Everything matches perfectly.</div>';
+			} else {
+				echo '<table class="wp-list-table widefat" style="margin:0;">';
+				echo '<thead><tr><th>Meta</th><th>Google Sheet</th><th>WordPress</th><th style="width:200px; text-align:center;">Actions</th></tr></thead><tbody>';
+				foreach ($diffs as $field => $values) {
+					echo '<tr>';
+					$label = isset($mapping[$field]) ? $mapping[$field] : $field;
+					if ($field === 'image_main') {
+						$label = 'Image principale';
+					} elseif ($field === 'image_gallery') {
+						$label = 'Galerie d\'images';
+					}
+					echo '<td style="width:15%; padding:8px; border-bottom:1px solid #ccd0d4;"><strong>' . esc_html($label) . '</strong></td>';
+
+					$gs_render = is_array($values['gs']) ? print_r($values['gs'], true) : $values['gs'];
+					$wp_render = is_array($values['wp']) ? print_r($values['wp'], true) : $values['wp'];
+
+					echo '<td style="width:35%; background:#e6ffed; padding:8px; word-break:break-word; font-size:12px; border-bottom:1px solid #ccd0d4;">' . wp_kses_post($gs_render) . '</td>';
+					echo '<td style="width:35%; background:#ffeef0; padding:8px; word-break:break-word; font-size:12px; border-bottom:1px solid #ccd0d4;">' . wp_kses_post($wp_render) . '</td>';
+					echo '<td style="width:15%; padding:8px; text-align:center; border-bottom:1px solid #ccd0d4;">';
+					echo '<div style="display:flex; flex-direction: column; gap:5px; justify-content:center;">';
+					echo '<button class="button button-small mjf-inline-sync-btn" data-id="' . $item->id . '" data-field="' . esc_attr($field) . '" data-dir="gs_to_wp"><span class="dashicons dashicons-arrow-down-alt" style="font-size:16px; width:16px; height:16px; line-height:16px; vertical-align:middle; margin-top:-2px;"></span> Import from Google Sheet</button>';
+					echo '<button class="button button-small mjf-inline-sync-btn" data-id="' . $item->id . '" data-field="' . esc_attr($field) . '" data-dir="wp_to_gs"><span class="dashicons dashicons-arrow-up-alt" style="font-size:16px; width:16px; height:16px; line-height:16px; vertical-align:middle; margin-top:-2px;"></span> Push to Google Sheet</button>';
+					echo '</div></td>';
+					echo '</tr>';
+				}
+				echo '</tbody></table>';
+			}
+		};
+
+		$render_row = function ($item, $is_variation = false, $bg_color = '#fff', $var_status = '') use ($render_meta_table, $title_col) {
+			if (!$item) return;
+			$diff_data = $item->diff_data_decoded;
+			$diffs = $diff_data['diff'] ?? [];
+
+			$status_icon = '';
+			if (($item->status === 'synced' || $item->status === 'synced_to_wp' || $item->status === 'synced_to_gs') && empty($var_status)) {
+				$status_icon = '<span class="dashicons dashicons-yes-alt" style="color:#46b450; font-size: 24px;" title="Synced"></span>';
+			} elseif ($item->status === 'missing_in_wp' || $var_status === 'missing_in_wp') {
+				$status_icon = '<span class="dashicons dashicons-warning" style="color:#dc3232; font-size: 24px;" title="Missing in WP"></span>';
+			} elseif ($item->status === 'translation_missing') {
+				$status_icon = '<span class="dashicons dashicons-warning" style="color:#ffb900; font-size: 24px;" title="EN Translation Missing"></span>';
+				$status_icon .= '<span class="dashicons dashicons-translation" style="color:#ffb900; font-size: 22px;" title="EN Translation Missing"></span>';
+			} elseif (!empty($var_status)) {
+				$status_icon = '<span class="dashicons dashicons-warning" style="color:#ffb900; font-size: 24px;" title="Une ou plusieurs variations ont un problème"></span>';
+			} else {
+				// Pending differences
+				$status_icon = '<span class="dashicons dashicons-update" style="color:#ffb900; font-size: 24px;" title="Differences found"></span>';
+			}
+
+			$title = $diff_data['raw'][$title_col] ?? '';
+
+			$edit_link = '';
+			$lang_badges = '<div style="display:flex; gap:4px; font-size:10px; font-weight:bold;">';
+			if ($item->product_id) {
+				$edit_url = get_edit_post_link($item->product_id);
+				if ($edit_url) {
+					$edit_link = ' <a href="' . esc_url($edit_url) . '" target="_blank" title="Edit in WooCommerce" style="margin-left:8px; color:#2271b1;"><span class="dashicons dashicons-edit"></span></a>';
+				}
+
+				$post_type = $is_variation ? 'product_variation' : 'product';
+				$has_fr = apply_filters('wpml_object_id', $item->product_id, $post_type, false, 'fr');
+				$has_en = apply_filters('wpml_object_id', $item->product_id, $post_type, false, 'en');
+
+				$fr_style = $has_fr ? 'background:#46b450; color:#fff;' : 'background:#eee; color:#aaa;';
+				$en_style = $has_en ? 'background:#46b450; color:#fff;' : 'background:#eee; color:#aaa;';
+
+				$lang_badges .= '<span style="padding:2px 6px; border-radius:3px; ' . $fr_style . '">FR</span>';
+				$lang_badges .= '<span style="padding:2px 6px; border-radius:3px; ' . $en_style . '">EN</span>';
+			} else {
+				$lang_badges .= '<span style="padding:2px 6px; border-radius:3px; background:#eee; color:#aaa;">FR</span>';
+				$lang_badges .= '<span style="padding:2px 6px; border-radius:3px; background:#eee; color:#aaa;">EN</span>';
+			}
+			$lang_badges .= '</div>';
+
+			if (!$is_variation) {
+				$var_warning_icon = '';
+				if (!empty($var_status)) {
+					$color = ($var_status === 'missing_in_wp') ? '#dc3232' : '#ffb900';
+					$var_warning_icon = ' <span class="dashicons dashicons-warning" style="color:' . $color . '; vertical-align:middle; margin-left:8px; font-size:18px; width:18px; height:18px;" title="Une ou plusieurs variations ont un problème"></span>';
+				}
+
+				// Parent Row
+				$wp_id_display = '—';
+				if ($item->product_id) {
+					$edit_url = get_edit_post_link($item->product_id);
+					$wp_id_display = $edit_url ? '<a href="' . esc_url($edit_url) . '" target="_blank" style="font-family:monospace; font-weight:bold; color:#2271b1; text-decoration:none;">' . $item->product_id . ' <span class="dashicons dashicons-external" style="font-size:16px; width:16px; height:16px; line-height:16px; vertical-align:middle; margin-top:-2px;"></span></a>' : $item->product_id;
+				}
+				echo '<tr class="mjf-row-clickable" data-sku="' . esc_attr($item->sku) . '" style="background:' . $bg_color . '; box-shadow: 0 1px 1px rgba(0,0,0,.04); cursor:pointer;">';
+				echo '<td style="vertical-align:middle; width:100px;">' . $wp_id_display . '</td>';
+				echo '<td style="vertical-align:middle; width:150px;"><strong style="font-family:monospace; font-size:13px; letter-spacing:-0.5px;">' . esc_html($item->sku) . '</strong></td>';
+				echo '<td style="vertical-align:middle;">' . esc_html($title) . $var_warning_icon . '</td>';
+				echo '<td style="vertical-align:middle; width:100px;">' . $lang_badges . '</td>';
+				echo '<td style="text-align:center; vertical-align:middle; width:100px;"><div style="display:flex; align-items:center; justify-content:center; gap: 8px;">' . $status_icon . '</div></td>';
+				echo '<td style="vertical-align:middle; width:40px;"><span class="dashicons dashicons-arrow-down-alt2 mjf-chevron-icon" style="color:#888;"></span></td>';
+				echo '</tr>';
+
+				// Details drawer (opened by toggle)
+				echo '<tr class="mjf-variation-row" data-parent-sku="' . esc_attr($item->sku) . '" style="display:none; background-color:' . $bg_color . ';">';
+				echo '<td colspan="6" style="padding: 10px 20px; border-left: 4px solid #2271b1;">';
+
+				echo '<h4 style="margin-top:0;">Parent Metadata</h4>';
+				$render_meta_table($item);
+			} else {
+				// Variation Title logic
+				$attr_title = '';
+				if ($item->product_id) {
+					$v_product = wc_get_product($item->product_id);
+					if ($v_product && $v_product->is_type('variation')) {
+						$attrs = $v_product->get_variation_attributes();
+						$parts = [];
+						foreach ($attrs as $k => $v) {
+							if ($v) {
+								$attr_name = str_replace('attribute_pa_', '', $k);
+								$attr_name = str_replace('attribute_', '', $attr_name);
+								$attr_name = ucfirst(str_replace('-', ' ', $attr_name));
+								$val = ucfirst(urldecode(str_replace('-', ' ', $v)));
+								$parts[] = $val . ' (' . $attr_name . ')';
+							}
+						}
+						$attr_title = implode(', ', $parts);
+					}
+				}
+				if (empty($attr_title)) {
+					$raw = $item->diff_data_decoded['raw'] ?? [];
+					$potential_attrs = ['Tailles', 'Couleur', 'Modèle'];
+					$found = [];
+					foreach ($potential_attrs as $pa) {
+						if (!empty($raw[$pa])) $found[] = $raw[$pa] . ' (' . $pa . ')';
+					}
+					$attr_title = !empty($found) ? implode(', ', $found) : 'Variation';
+				}
+
+				// Variation Row inside variation table
+				$wp_id_display = '—';
+				if ($item->product_id) {
+					$edit_url = get_edit_post_link($item->product_id);
+					$wp_id_display = $edit_url ? '<a href="' . esc_url($edit_url) . '" target="_blank" style="font-family:monospace; font-weight:bold; color:#2271b1; text-decoration:none;">' . $item->product_id . ' <span class="dashicons dashicons-external" style="font-size:11px; width:11px; height:11px; line-height:11px; vertical-align:middle; margin-top:-2px;"></span></a>' : $item->product_id;
+				}
+				echo '<tr class="mjf-row-clickable" data-sku="' . esc_attr($item->sku) . '" style="background:#fff; cursor:pointer;">';
+				echo '<td style="vertical-align:middle; width:100px;"><span class="dashicons dashicons-subdirectory-right" style="color:#ccc; margin-right:5px;"></span>' . $wp_id_display . '</td>';
+				echo '<td><code style="font-family:monospace; background:none; padding:0; color:inherit; font-size:12px;">' . esc_html($item->sku) . '</code></td>';
+				echo '<td><strong>' . esc_html($attr_title) . '</strong></td>';
+				echo '<td style="vertical-align:middle;">' . $lang_badges . '</td>';
+				echo '<td style="text-align:center;"><div style="display:flex; align-items:center; justify-content:center; gap: 8px;">' . $status_icon . '</div></td>';
+				echo '<td><span class="dashicons dashicons-arrow-down-alt2 mjf-chevron-icon" style="color:#888;"></span></td>';
+				echo '</tr>';
+
+				// Variation Details drawer
+				echo '<tr class="mjf-variation-row" data-parent-sku="' . esc_attr($item->sku) . '" style="display:none;">';
+				echo '<td colspan="6" style="padding: 10px 20px; border-left: 4px solid #ffb900; background:#fafafa;">';
+				$render_meta_table($item);
+				echo '</td></tr>';
+			}
+		};
+
+		ob_start();
+		if (empty($paged_groups)) {
+			echo '<p>No data found.</p>';
+		} else {
+			echo '<table class="wp-list-table widefat striped" style="margin-top:15px; border:1px solid #ccd0d4; border-spacing:0;">';
+			echo '<thead><tr>';
+			echo '<th style="width:100px;">WP ID</th>';
+			echo '<th style="width:150px;">SKU</th>';
+			echo '<th>Titre</th>';
+			echo '<th style="width:100px;">Langues</th>';
+			echo '<th style="text-align:center; width:150px;">Status</th>';
+			echo '<th style="width:40px;"></th>';
+			echo '</tr></thead><tbody>';
+
+			$row_count = 0;
+			foreach ($paged_groups as $group) {
+				if ($group['parent']) {
+					$row_count++;
+					$bg = ($row_count % 2 === 0) ? '#f9f9f9' : '#fff';
+
+					$var_status = '';
+					if (!empty($group['variations'])) {
+						foreach ($group['variations'] as $var) {
+							if ($var->status !== 'synced' && $var->status !== 'synced_to_wp' && $var->status !== 'synced_to_gs') {
+								if ($var->status === 'missing_in_wp') {
+									$var_status = 'missing_in_wp';
+									break;
+								} else {
+									$var_status = 'pending';
+								}
+							}
+						}
+					}
+
+					$render_row($group['parent'], false, $bg, $var_status);
+
+					// Variations section
+					if (!empty($group['variations'])) {
+						$has_missing_translations = false;
+						$missing_var_id = 0;
+						foreach ($group['variations'] as $var) {
+							if ($var->status === 'translation_missing') {
+								$has_missing_translations = true;
+								$missing_var_id = $var->id;
+								break;
+							}
+						}
+
+						echo '<h4 style="margin-top:20px; margin-bottom:10px;">Variations</h4>';
+						if ($has_missing_translations) {
+							echo '<button class="button button-small mjf-create-translation-btn" data-id="' . esc_attr($missing_var_id) . '" style="margin-bottom:10px;"><span class="dashicons dashicons-translation" style="font-size:14px; width:14px; height:14px; line-height:14px; vertical-align:middle; margin-top:-2px; color:#2271b1;"></span> Générer les traductions EN manquantes</button>';
+						}
+						echo '<table class="wp-list-table widefat" style="margin-bottom:20px; border:1px solid #eee;">';
+						echo '<thead><tr><th style="width:100px;">WP ID</th><th style="width:150px;">SKU</th><th>Variation (Attributs)</th><th style="width:100px;">Langues</th><th style="text-align:center; width:100px;">Status</th><th style="width:40px;"></th></tr></thead>';
+						echo '<tbody>';
+						foreach ($group['variations'] as $variation) {
+							$render_row($variation, true);
+						}
+						echo '</tbody></table>';
+					}
+
+					// Close parent td/tr
+					echo '</td></tr>';
+				}
+			}
+			echo '</tbody></table>';
+
+			// Pagination
+			if ($total_pages > 1) {
+				echo '<div class="tablenav-pages" style="margin-top:15px;">';
+				for ($i = 1; $i <= $total_pages; $i++) {
+					echo '<button class="button mjf-page-btn' . ($i === $page ? 'button-primary' : '') . '" data-page="' . $i . '">' . $i . '</button> ';
+				}
+				echo '</div>';
+			}
+		}
+
+		wp_send_json_success(['html' => ob_get_clean()]);
+	}
+
+	public function ajax_sync_single_field()
+	{
+		if (! current_user_can('manage_woocommerce')) wp_send_json_error('Permission denied');
+
+		$id        = isset($_POST['id']) ? intval($_POST['id']) : 0;
+		$field     = isset($_POST['field']) ? sanitize_text_field($_POST['field']) : '';
+		$direction = isset($_POST['direction']) ? sanitize_text_field($_POST['direction']) : '';
+
+		if (!$id || !$field || !$direction) wp_send_json_error('Missing parameters');
+
+		global $wpdb;
+		$row = $wpdb->get_row($wpdb->prepare("SELECT * FROM {$this->table_name} WHERE id = %d", $id));
+		if (!$row) wp_send_json_error('Row not found');
+
+		$diff_data = json_decode($row->diff_data, true);
+		$raw_item = $diff_data['raw'] ?? [];
+		$diffs = $diff_data['diff'] ?? [];
+
+		if (!isset($diffs[$field])) wp_send_json_success(['status' => 'synced']);
+
+		$vals = $diffs[$field];
+		$mapping = $this->get_hardcoded_mapping();
+
+		if ($direction === 'gs_to_wp') {
+			if ($field === 'stock' && $row->product_id) {
+				wp_send_json_error('L\'importation du stock depuis Google Sheet est bloquée pour les produits existants afin de préserver les données de vente.');
+			}
+			$this->sync_field_to_wp($row->product_id, $field, $vals['gs'], $raw_item);
+		} else if ($direction === 'wp_to_gs') {
+			$gs_col = $mapping[$field] ?? $field;
+			// Write to sheet
+			$result = $this->api->write_to_google_sheet($row->gs_row_index, $gs_col, $vals['wp']);
+			if (is_wp_error($result)) {
+				wp_send_json_error($result->get_error_message());
+			}
+		}
+
+		// Remove field from diffs
+		unset($diffs[$field]);
+		$diff_data['diff'] = $diffs;
+
+		$new_status = empty($diffs) ? 'synced' : $row->status;
+
+		$wpdb->update($this->table_name, [
+			'status' => $new_status,
+			'diff_data' => wp_json_encode($diff_data)
+		], ['id' => $id]);
+
+		wp_send_json_success([
+			'new_status' => $new_status,
+			'message' => 'Field synced successfully.'
+		]);
+	}
+
+	/**
+	 * Create a missing product in WooCommerce from Google Sheet data
+	 */
+	public function ajax_create_product()
+	{
+		if (! current_user_can('manage_woocommerce')) wp_send_json_error('Permission denied');
+
+		$id = isset($_POST['id']) ? intval($_POST['id']) : 0;
+		if (!$id) wp_send_json_error('Missing parameters');
+
+		global $wpdb;
+		$row = $wpdb->get_row($wpdb->prepare("SELECT * FROM {$this->table_name} WHERE id = %d", $id));
+		if (!$row) wp_send_json_error('Entrée introuvable en base.');
+
+		global $sitepress;
+		$original_lang = null;
+		if (isset($sitepress)) {
+			$original_lang = $sitepress->get_current_language();
+			$sitepress->switch_lang('fr');
+		}
+
+		$diff_data = json_decode($row->diff_data, true);
+		$raw = $diff_data['raw'] ?? [];
+		$mapping = $this->get_hardcoded_mapping();
+
+		$type_raw = strtolower(trim($raw[$mapping['type'] ?? 'Type'] ?? ''));
+		$sku      = trim($raw[$mapping['sku'] ?? 'UGS'] ?? '');
+		$title    = trim($raw[$mapping['title'] ?? 'Nom du produit'] ?? '');
+		$status   = trim($raw[$mapping['status'] ?? 'Status'] ?? '');
+		$parent_sku = trim($raw[$mapping['parent_sku'] ?? 'UGS Parent'] ?? '');
+		$price    = trim($raw[$mapping['price'] ?? 'Prix'] ?? '');
+		$stock    = trim($raw[$mapping['stock'] ?? 'Stock'] ?? '');
+		$weight   = trim($raw[$mapping['weight'] ?? 'Poids (kg)'] ?? '');
+		$description   = $raw[$mapping['description'] ?? 'Description FR'] ?? '';
+		$short_desc    = $raw[$mapping['short_description'] ?? 'Contenu additionel FR'] ?? '';
+		$title_en      = trim($raw[$mapping['title_en'] ?? 'Nom du produit EN'] ?? '');
+		$description_en = $raw[$mapping['description_en'] ?? 'Description EN'] ?? '';
+		$content_en    = $raw[$mapping['content_en'] ?? 'Contenu additionel EN'] ?? '';
+		$cat_primary   = trim($raw[$mapping['cat_primary'] ?? 'Catégorie principale'] ?? '');
+		$cat_secondary = trim($raw[$mapping['cat_secondary'] ?? 'Catégorie secondaire'] ?? '');
+		$shipping_class = trim($raw[$mapping['shipping_class'] ?? "Classe d'expédition"] ?? '');
+
+		// Inherit price from parent if variation and price is empty
+		if ($type_raw === 'variation' && empty($price) && !empty($parent_sku)) {
+			$parent_entry = $wpdb->get_row($wpdb->prepare("SELECT diff_data FROM {$this->table_name} WHERE sku = %s", $parent_sku));
+			if ($parent_entry) {
+				$parent_dd = json_decode($parent_entry->diff_data, true);
+				$price = trim($parent_dd['raw'][$mapping['price'] ?? 'Prix'] ?? '');
+			}
+		}
+
+		// Map WP post status
+		$status_map = [
+			'publish' => 'publish',
+			'publié' => 'publish',
+			'publie' => 'publish',
+			'active' => 'publish',
+			'draft'   => 'draft',
+			'brouillon' => 'draft',
+			'private' => 'private',
+			'privé' => 'private',
+		];
+		$wp_status = $status_map[strtolower($status)] ?? 'draft';
+
+		try {
+			if ($type_raw === 'variation') {
+				// Create as variation of an existing parent
+				$parent_id = 0;
+				$parent_row = $wpdb->get_row($wpdb->prepare("SELECT product_id FROM {$this->table_name} WHERE sku = %s", $parent_sku));
+				if ($parent_row && $parent_row->product_id) {
+					$parent_id = intval($parent_row->product_id);
+				}
+				if (!$parent_id) {
+					$parent_id = wc_get_product_id_by_sku($parent_sku);
+				}
+
+				global $sitepress;
+				if (isset($sitepress) && $parent_id) {
+					$fr_parent_id = apply_filters('wpml_object_id', $parent_id, 'product', true, 'fr');
+					if ($fr_parent_id) {
+						$parent_id = $fr_parent_id;
+					}
+				}
+
+				if (!$parent_id) wp_send_json_error('Produit parent introuvable dans WooCommerce.');
+
+				$variation = new WC_Product_Variation();
+				$variation->set_parent_id($parent_id);
+				$variation->set_sku($sku);
+				$variation->set_status('publish');
+				if (!empty($price)) {
+					$price_clean = (float) str_replace(',', '.', $price);
+					$variation->set_regular_price($price_clean);
+					$variation->set_price($price_clean);
+				}
+				if ($stock !== '') {
+					$variation->set_manage_stock(true);
+					$variation->set_stock_quantity((int) $stock);
+				} else {
+					$variation->set_manage_stock(true);
+					$variation->set_stock_quantity(0);
+				}
+				if (!empty($weight)) $variation->set_weight((float) str_replace(',', '.', $weight));
+
+				// Set Attributes
+				$parent_product = wc_get_product($parent_id);
+				if ($parent_product) {
+					$parent_attributes = $parent_product->get_attributes();
+					$attr_data = [];
+					$attr_columns = ['Taille', 'Couleur', 'Modèle', 'Année'];
+					foreach ($attr_columns as $col) {
+						$matched_col = null;
+						$val = $this->extract_attribute_from_raw($raw, $col, $matched_col);
+						if (!empty($val)) {
+							$tax_name = wc_attribute_taxonomy_name($matched_col);
+							$matched_key = false;
+
+							if (isset($parent_attributes[$tax_name])) {
+								$matched_key = $tax_name;
+							} else {
+								foreach ($parent_attributes as $key => $attr_obj) {
+									$label = wc_attribute_label($key);
+									if ($attr_obj->get_name() === $col || $label === $col || $label === rtrim($col, 's')) {
+										$matched_key = $key;
+										break;
+									}
+								}
+							}
+
+							if (!$matched_key) {
+								$matched_key = $tax_name;
+								$new_attr = new WC_Product_Attribute();
+								$new_attr->set_id(wc_attribute_taxonomy_id_by_name($matched_key));
+								$new_attr->set_name($matched_key);
+								$new_attr->set_options([]);
+								$new_attr->set_visible(true);
+								$new_attr->set_variation($matched_key === 'pa_tailles' || $matched_key === 'pa_taille');
+								$parent_attributes[$matched_key] = $new_attr;
+								$parent_product->set_attributes($parent_attributes);
+								$parent_product->save();
+							}
+
+							if ($parent_attributes[$matched_key]->is_taxonomy()) {
+								$term = get_term_by('name', $val, $matched_key);
+								if (!$term) {
+									// Auto-create missing term
+									$inserted = wp_insert_term($val, $matched_key);
+									if (!is_wp_error($inserted)) {
+										$term = get_term($inserted['term_id'], $matched_key);
+										$term_id_to_add = $term->term_id;
+									} elseif (is_wp_error($inserted) && isset($inserted->error_data['term_exists'])) {
+										$term_id_to_add = $inserted->error_data['term_exists'];
+										$term = get_term($term_id_to_add, $matched_key);
+									} else {
+										$term = false;
+									}
+								} else {
+									$term_id_to_add = $term->term_id;
+								}
+
+								if ($term) {
+									// Add to parent product attribute options
+									$options = $parent_attributes[$matched_key]->get_options();
+									if (!in_array($term_id_to_add, $options)) {
+										$options[] = $term_id_to_add;
+										$parent_attributes[$matched_key]->set_options($options);
+										$parent_product->set_attributes($parent_attributes);
+										$parent_product->save();
+										wp_set_object_terms($parent_id, $options, $matched_key);
+									}
+								}
+								$attr_data[$matched_key] = $term ? $term->slug : sanitize_title($val);
+							} else {
+								$attr_data[$matched_key] = $val;
+							}
+						}
+					}
+					if (!empty($attr_data)) {
+						$variation->set_attributes($attr_data);
+					} else {
+						wp_send_json_error('Impossible de générer la variation : aucun attribut valide trouvé. Vérifiez que le produit parent a bien ses attributs configurés et enregistrés dans WooCommerce.');
+					}
+				}
+
+				if (!empty($shipping_class)) {
+					$this->set_product_shipping_class($variation, $shipping_class);
+				}
+
+				$new_id = $variation->save();
+
+				// Trigger WPML variation sync
+				global $woocommerce_wpml;
+				if (isset($woocommerce_wpml) && isset($woocommerce_wpml->sync_variations_data)) {
+					$woocommerce_wpml->sync_variations_data->sync_product_variations_action($parent_id);
+				}
+				// Force parent to rebuild children cache
+				$parent_product = wc_get_product($parent_id);
+				if ($parent_product) $parent_product->save();
+			} elseif ($type_raw === 'variable') {
+				$product = new WC_Product_Variable();
+				$product->set_name($title);
+				$product->set_sku($sku);
+				$product->set_status($wp_status);
+				if (!empty($description)) $product->set_description($description);
+				if (!empty($short_desc)) $product->set_short_description($short_desc);
+
+				// Set Categories
+				if (!empty($cat_primary) || !empty($cat_secondary)) {
+					$cat_ids = $this->get_category_ids($cat_primary, $cat_secondary);
+					if (!empty($cat_ids)) {
+						$product->set_category_ids($cat_ids);
+					}
+				}
+
+				// Set Attributes
+				$formatted_item = $this->format_raw_for_upsert($raw);
+				if (!empty($formatted_item['attributes'])) {
+					$this->set_variable_attributes($product, $formatted_item['attributes'], $formatted_item['attr_settings']);
+				}
+
+				if (!empty($shipping_class)) {
+					$this->set_product_shipping_class($product, $shipping_class);
+				}
+
+				$new_id = $product->save();
+			} else {
+				// Simple product
+				$product = new WC_Product_Simple();
+				$product->set_name($title);
+				$product->set_sku($sku);
+				$product->set_status($wp_status);
+				if (!empty($description)) $product->set_description($description);
+				if (!empty($short_desc)) $product->set_short_description($short_desc);
+				if (!empty($price)) {
+					$price_clean = (float) str_replace(',', '.', $price);
+					$product->set_regular_price($price_clean);
+					$product->set_price($price_clean);
+				}
+				if ($stock !== '') {
+					$product->set_manage_stock(true);
+					$product->set_stock_quantity((int) $stock);
+				}
+				if (!empty($weight)) $product->set_weight((float) str_replace(',', '.', $weight));
+
+				// Set Categories
+				if (!empty($cat_primary) || !empty($cat_secondary)) {
+					$cat_ids = $this->get_category_ids($cat_primary, $cat_secondary);
+					if (!empty($cat_ids)) {
+						$product->set_category_ids($cat_ids);
+					}
+				}
+
+				if (!empty($shipping_class)) {
+					$this->set_product_shipping_class($product, $shipping_class);
+				}
+
+				$new_id = $product->save();
+			}
+
+			if (!$new_id || is_wp_error($new_id)) {
+				wp_send_json_error('Échec lors de la sauvegarde du produit dans WooCommerce.');
+			}
+
+			// Force WPML language to FR for the newly created product
+			global $sitepress;
+			if (isset($sitepress)) {
+				$wpml_element_type = apply_filters('wpml_element_type', 'post_product');
+				if ($type_raw === 'variation') {
+					$wpml_element_type = apply_filters('wpml_element_type', 'post_product_variation');
+				}
+				$language_details = apply_filters('wpml_element_language_details', null, ['element_id' => $new_id, 'element_type' => $wpml_element_type]);
+				if (empty($language_details) || $language_details->language_code !== 'fr') {
+					$sitepress->set_element_language_details($new_id, $wpml_element_type, false, 'fr');
+				}
+			}
+
+			// Store EN data as post meta for reference
+			update_post_meta($new_id, '_mjf_title_en', sanitize_text_field($title_en));
+			update_post_meta($new_id, '_mjf_description_en', wp_kses_post($description_en));
+			update_post_meta($new_id, '_mjf_content_en', wp_kses_post($content_en));
+
+			// Store FedEx custom meta
+			$fedex_map = [
+				'_wf_hs_code'                     => 'Numéro de tarif HS',
+				'_ph_commodity_description'       => 'Description Fedex',
+				'_wf_freight_class'               => 'Classe de fret',
+				'_ph_fedex_signature_option'      => 'Signature de livraison',
+				'_ph_manufacture_country'         => 'Pays de fabrication',
+				'_wf_manufacture_country'         => 'Pays de fabrication',
+				'_wf_fedex_custom_declared_value' => 'Custom Declared Value',
+			];
+			foreach ($fedex_map as $meta_key => $gs_col) {
+				$val = trim($raw[$gs_col] ?? '');
+				if ($val !== '') update_post_meta($new_id, $meta_key, $this->normalize_fedex_select_value($meta_key, $val));
+			}
+
+			// Write the new WP ID back to the Google Sheet
+			$wp_id_col = $mapping['wp_id'] ?? 'WP ID';
+			if ($wp_id_col) {
+				$this->api->write_to_google_sheet($row->gs_row_index, $wp_id_col, $new_id);
+			}
+
+			// Refresh this item status
+			$new_diff = $this->compare_item($new_id, $raw, $mapping, $type_raw);
+			$status_new = empty($new_diff) ? 'synced' : 'pending';
+
+			// Update sync table
+			$wpdb->update($this->table_name, [
+				'product_id' => $new_id,
+				'status'     => $status_new,
+				'diff_data'  => wp_json_encode([
+					'type'       => $type_raw,
+					'parent_sku' => $parent_sku,
+					'raw'        => $raw,
+					'diff'       => $new_diff
+				])
+			], ['id' => $id]);
+
+			if (isset($sitepress) && $original_lang) {
+				$sitepress->switch_lang($original_lang);
+			}
+
+			wp_send_json_success(['message' => 'Produit créé avec succès (ID: ' . $new_id . ').']);
+		} catch (\Exception $e) {
+			if (isset($sitepress) && $original_lang) {
+				$sitepress->switch_lang($original_lang);
+			}
+			wp_send_json_error('Exception : ' . $e->getMessage());
+		}
+	}
+
+	public function ajax_create_translation()
+	{
+		if (! current_user_can('manage_woocommerce')) wp_send_json_error('Permission denied');
+
+		$id = isset($_POST['id']) ? intval($_POST['id']) : 0;
+		if (!$id) wp_send_json_error('Missing ID');
+
+		global $wpdb;
+		$item = $wpdb->get_row($wpdb->prepare("SELECT * FROM {$this->table_name} WHERE id = %d", $id));
+		if (!$item) wp_send_json_error('Item not found in queue.');
+
+		$diff_data = json_decode($item->diff_data, true);
+		$raw = $diff_data['raw'] ?? [];
+		$mapping = $this->get_hardcoded_mapping();
+		$sku = $item->sku;
+
+		$product_id = $item->product_id;
+		if (!$product_id) {
+			$product_id = wc_get_product_id_by_sku($sku);
+		}
+		if (!$product_id) wp_send_json_error('Original product (FR) not found.');
+
+		$title_en = trim($raw[$mapping['title_en'] ?? 'Nom du produit EN'] ?? '');
+		$type = $diff_data['type'] ?? 'simple';
+
+		if ($type === 'variation') {
+			$parent_sku = $diff_data['parent_sku'] ?? '';
+			if (!$parent_sku) wp_send_json_error('Parent SKU not found for this variation.');
+
+			$parent_id = 0;
+			$parent_row = $wpdb->get_row($wpdb->prepare("SELECT product_id FROM {$this->table_name} WHERE sku = %s", $parent_sku));
+			if ($parent_row && $parent_row->product_id) {
+				$parent_id = intval($parent_row->product_id);
+			}
+			if (!$parent_id) {
+				$parent_id = wc_get_product_id_by_sku($parent_sku);
+			}
+			if (!$parent_id) wp_send_json_error('Parent product not found.');
+
+			global $woocommerce_wpml;
+			if (isset($woocommerce_wpml) && isset($woocommerce_wpml->sync_variations_data)) {
+				$woocommerce_wpml->sync_variations_data->sync_product_variations_action($parent_id);
+			}
+		} else {
+			if (empty($title_en)) wp_send_json_error('English title is required.');
+			$formatted_item = $this->format_raw_for_upsert($raw);
+			$this->upsert_translation($product_id, $formatted_item, 'en');
+		}
+
+		// Refresh this item status
+		$new_diff = $this->compare_item($product_id, $raw, $mapping, $type);
+		$status = empty($new_diff) ? 'synced' : 'pending';
+
+		$wpdb->update($this->table_name, [
+			'status' => $status,
+			'diff_data' => wp_json_encode([
+				'type' => $diff_data['type'] ?? 'simple',
+				'parent_sku' => $diff_data['parent_sku'] ?? '',
+				'raw' => $raw,
+				'diff' => $new_diff
+			])
+		], ['id' => $id]);
+
+		wp_send_json_success('English translation created successfully.');
+	}
+
+	public function ajax_update_sync_direction()
+	{
+		if (! current_user_can('manage_woocommerce')) wp_send_json_error('Permission denied');
+
+		$id        = isset($_POST['id']) ? intval($_POST['id']) : 0;
+		$field     = isset($_POST['field']) ? sanitize_text_field($_POST['field']) : '';
+		$direction = isset($_POST['direction']) ? sanitize_text_field($_POST['direction']) : '';
+
+		if (!$id || !$field || !$direction) {
+			wp_send_json_error('Missing parameters');
+		}
+
+		global $wpdb;
+		$row = $wpdb->get_row($wpdb->prepare("SELECT diff_data FROM {$this->table_name} WHERE id = %d", $id));
+		if ($row) {
+			$diff_data = json_decode($row->diff_data, true);
+			$diff_data['directions'][$field] = $direction;
+			$wpdb->update($this->table_name, ['diff_data' => wp_json_encode($diff_data)], ['id' => $id]);
+			wp_send_json_success();
+		}
+		wp_send_json_error('Row not found');
+	}
+
+	public function ajax_execute_sync()
+	{
+		if (! current_user_can('manage_woocommerce')) wp_send_json_error('Permission denied');
+
+		@ini_set('memory_limit', '512M');
+
+		global $wpdb;
+		$table_name = $this->table_name;
+
+		$items = $wpdb->get_results("SELECT * FROM {$table_name} WHERE status = 'pending' LIMIT 10");
+
+		if (empty($items)) {
+			wp_send_json_success(['message' => 'Sync complete!', 'continue' => false]);
+		}
+
+		$processed = 0;
+		$mapping = $this->get_hardcoded_mapping();
+
+		foreach ($items as $item) {
+			$diff_data = json_decode($item->diff_data, true);
+			$raw_item = $diff_data['raw'] ?? [];
+			$diffs = $diff_data['diff'] ?? [];
+			$directions = $diff_data['directions'] ?? [];
+
+			foreach ($diffs as $field => $vals) {
+				if ($field === 'stock' && $item->product_id) continue;
+
+				$dir = $directions[$field] ?? 'gs_to_wp';
+				if ($dir === 'ignore') continue;
+
+				if ($dir === 'gs_to_wp') {
+					$this->sync_field_to_wp($item->product_id, $field, $vals['gs'], $raw_item);
+				} else if ($dir === 'wp_to_gs') {
+					$gs_col = $mapping[$field] ?? '';
+					if ($gs_col) {
+						$this->api->write_to_google_sheet($item->gs_row_index, $gs_col, $vals['wp']);
+					}
+				}
+			}
+			$wpdb->update($table_name, ['status' => 'processed'], ['id' => $item->id]);
+			$processed++;
+		}
+
+		wp_send_json_success([
+			'message' => "Processed $processed items.",
+			'continue' => true
+		]);
+	}
+
+	private function sync_field_to_wp($product_id, $field, $value, $raw_item)
+	{
+		if (!$product_id) return;
+
+		// Block GS to WP stock import for existing products to preserve real store stock
+		if ($field === 'stock') {
+			return;
+		}
+
+		$product = wc_get_product($product_id);
+		if (!$product) return;
+
+		// Handle WPML Translation fields
+		if (in_array($field, ['title_en', 'description_en', 'content_en', 'wpml_missing'])) {
+			$formatted_item = $this->format_raw_for_upsert($raw_item);
+			$this->upsert_translation($product_id, $formatted_item, 'en');
+			return;
+		}
+
+		global $sitepress;
+		$original_lang = null;
+		if (isset($sitepress)) {
+			$original_lang = $sitepress->get_current_language();
+			$sitepress->switch_lang('fr');
+		}
+
+		switch ($field) {
+			case 'sku':
+				$product->set_sku($value);
+				break;
+			case 'title':
+				$product->set_name($value);
+				break;
+			case 'price':
+				$product->set_regular_price($value);
+				break;
+			case 'stock':
+				$product->set_stock_quantity($value);
+				$product->set_manage_stock(true);
+				break;
+			case 'weight':
+				$product->set_weight($value);
+				break;
+			case 'description':
+				$product->set_description($value);
+				break;
+			case 'short_description':
+				$product->set_short_description($value);
+				break;
+			case 'image_main':
+				$mapping = $this->get_hardcoded_mapping();
+				$image_slug_col = $mapping['image_slug'] ?? 'Slug Image';
+				$slug = trim($raw_item[$image_slug_col] ?? '');
+				if ($slug) {
+					$id = $this->find_attachment_by_base_name($slug . '-main');
+					if ($id) $product->set_image_id($id);
+				}
+				break;
+			case 'image_gallery':
+				$mapping = $this->get_hardcoded_mapping();
+				$image_slug_col = $mapping['image_slug'] ?? 'Slug Image';
+				$slug = trim($raw_item[$image_slug_col] ?? '');
+				if ($slug) {
+					$ids = [];
+					for ($i = 1; $i <= 25; $i++) {
+						$id = $this->find_attachment_by_base_name($slug . '-' . $i);
+						if ($id) $ids[] = (int)$id;
+					}
+					if (!empty($ids)) $product->set_gallery_image_ids($ids);
+				}
+				break;
+			case 'cat_primary':
+				$mapping = $this->get_hardcoded_mapping();
+				$sec_col = $mapping['cat_secondary'] ?? 'Catégorie secondaire';
+				$sec_val = isset($raw_item[$sec_col]) ? trim($raw_item[$sec_col]) : '';
+				$cat_ids = $this->get_category_ids($value, $sec_val);
+				$product->set_category_ids($cat_ids);
+				break;
+			case 'cat_secondary':
+				$mapping = $this->get_hardcoded_mapping();
+				$prim_col = $mapping['cat_primary'] ?? 'Catégorie principale';
+				$prim_val = isset($raw_item[$prim_col]) ? trim($raw_item[$prim_col]) : '';
+				$cat_ids = $this->get_category_ids($prim_val, $value);
+				$product->set_category_ids($cat_ids);
+				break;
+			case 'attributes':
+				$formatted_item = $this->format_raw_for_upsert($raw_item);
+				$this->set_variable_attributes($product, $formatted_item['attributes'], $formatted_item['attr_settings']);
+				// Force WC to sync term relationships
+				$product_attributes = $product->get_attributes();
+				foreach ($product_attributes as $attr) {
+					if ($attr && $attr->is_taxonomy()) {
+						wp_set_object_terms($product->get_id(), $attr->get_options(), $attr->get_name());
+					}
+				}
+				break;
+			case 'shipping_class':
+				$this->set_product_shipping_class($product, $value);
+				break;
+			default:
+				// Meta keys
+				if (strpos($field, '_') === 0) {
+					$normalized_value = $this->normalize_fedex_select_value($field, $value);
+					$product->update_meta_data($field, $normalized_value);
+					// Keep both _ph_manufacture_country and _wf_manufacture_country in sync
+					if ($field === '_ph_manufacture_country') {
+						$product->update_meta_data('_wf_manufacture_country', $normalized_value);
+					} elseif ($field === '_wf_manufacture_country') {
+						$product->update_meta_data('_ph_manufacture_country', $normalized_value);
+					}
+				}
+		}
+		$product->save();
+
+		// Sync changes to English translation if active
+		$product_type = $product->get_type();
+		if ($product_type === 'variation') {
+			$parent_id = $product->get_parent_id();
+			global $woocommerce_wpml;
+			if (isset($woocommerce_wpml) && isset($woocommerce_wpml->sync_variations_data)) {
+				$woocommerce_wpml->sync_variations_data->sync_product_variations_action($parent_id);
+			}
+			if ($field === 'shipping_class') {
+				$translated_id = apply_filters('wpml_object_id', $product_id, 'product_variation', false, 'en');
+				if ($translated_id && $translated_id !== $product_id) {
+					$translated_product = wc_get_product($translated_id);
+					if ($translated_product) {
+						global $sitepress;
+						$orig_lang_for_sync = null;
+						if (isset($sitepress)) {
+							$orig_lang_for_sync = $sitepress->get_current_language();
+							$sitepress->switch_lang('en');
+						}
+
+						$wp_shipping_class_id = $product->get_shipping_class_id();
+						if ($wp_shipping_class_id) {
+							$translated_class_id = $this->translate_or_create_term($wp_shipping_class_id, 'product_shipping_class', 'en');
+							$translated_product->set_shipping_class_id($translated_class_id);
+							if ($translated_product->get_id()) {
+								wp_set_object_terms($translated_product->get_id(), array((int)$translated_class_id), 'product_shipping_class');
+							}
+						} else {
+							$translated_product->set_shipping_class_id(0);
+							if ($translated_product->get_id()) {
+								wp_set_object_terms($translated_product->get_id(), array(), 'product_shipping_class');
+							}
+						}
+						$translated_product->save();
+
+						if (isset($sitepress) && $orig_lang_for_sync) {
+							$sitepress->switch_lang($orig_lang_for_sync);
+						}
+					}
+				}
+			}
+		} else {
+			$translated_id = apply_filters('wpml_object_id', $product_id, 'product', false, 'en');
+			if ($translated_id && $translated_id !== $product_id) {
+				$translated_product = wc_get_product($translated_id);
+				if ($translated_product) {
+					switch ($field) {
+						case 'price':
+							$translated_product->set_regular_price($value);
+							$translated_product->save();
+							break;
+						case 'stock':
+							$translated_product->set_stock_quantity($value);
+							$translated_product->set_manage_stock(true);
+							$translated_product->save();
+							break;
+						case 'weight':
+							$translated_product->set_weight($value);
+							$translated_product->save();
+							break;
+						case 'shipping_class':
+							global $sitepress;
+							$orig_lang_for_sync = null;
+							if (isset($sitepress)) {
+								$orig_lang_for_sync = $sitepress->get_current_language();
+								$sitepress->switch_lang('en');
+							}
+
+							$wp_shipping_class_id = $product->get_shipping_class_id();
+							if ($wp_shipping_class_id) {
+								$translated_class_id = $this->translate_or_create_term($wp_shipping_class_id, 'product_shipping_class', 'en');
+								$translated_product->set_shipping_class_id($translated_class_id);
+								if ($translated_product->get_id()) {
+									wp_set_object_terms($translated_product->get_id(), array((int)$translated_class_id), 'product_shipping_class');
+								}
+							} else {
+								$translated_product->set_shipping_class_id(0);
+								if ($translated_product->get_id()) {
+									wp_set_object_terms($translated_product->get_id(), array(), 'product_shipping_class');
+								}
+							}
+							$translated_product->save();
+
+							if (isset($sitepress) && $orig_lang_for_sync) {
+								$sitepress->switch_lang($orig_lang_for_sync);
+							}
+							break;
+						case 'attributes':
+							$this->sync_attributes_to_translation($product, $translated_product, 'en');
+							if ($product_type === 'variable') {
+								global $woocommerce_wpml;
+								if (isset($woocommerce_wpml) && isset($woocommerce_wpml->sync_variations_data)) {
+									$woocommerce_wpml->sync_variations_data->sync_product_variations_action($product_id);
+								}
+							}
+							break;
+					}
+				}
+			}
+		}
+
+		if (isset($sitepress) && $original_lang) {
+			$sitepress->switch_lang($original_lang);
+		}
+	}
+
+	/**
+	 * Normalize FedEx select field values coming from Google Sheets.
+	 *
+	 * For _wf_freight_class: accepts "CLASS 125" or "125" → stores "125"
+	 * For _ph_fedex_signature_option: accepts French labels or raw values → stores the correct constant
+	 */
+	private function normalize_fedex_select_value($meta_key, $value)
+	{
+		$value = trim((string) $value);
+
+		if ($meta_key === '_wf_freight_class') {
+			// Accept "CLASS 125", "class 125", or plain "125" / "77.5"
+			$normalized = preg_replace('/^class\s*/i', '', $value);
+			$normalized = trim($normalized);
+			// Valid values for this select field
+			$valid = ['50', '55', '60', '65', '70', '77.5', '85', '92.5', '100', '110', '125', '150', '175', '200', '250', '300', '400', '500'];
+			if (in_array($normalized, $valid, true)) {
+				return $normalized;
+			}
+			// Return empty if not recognized so we don't pollute the field
+			return '';
+		}
+
+		if ($meta_key === '_ph_fedex_signature_option') {
+			// Map French GS labels → FedEx constant values
+			$label_map = [
+				'matinée'              => 'ADULT',
+				'matinee'              => 'ADULT',
+				'direct'               => 'DIRECT',
+				'indirect'             => 'INDIRECT',
+				'signature obligatoire' => 'NO_SIGNATURE_REQUIRED',
+				'service par défaut'   => 'SERVICE_DEFAULT',
+				'service par defaut'   => 'SERVICE_DEFAULT',
+			];
+			// Also accept raw constant values as-is
+			$valid_constants = ['ADULT', 'DIRECT', 'INDIRECT', 'NO_SIGNATURE_REQUIRED', 'SERVICE_DEFAULT'];
+			if (in_array($value, $valid_constants, true)) {
+				return $value;
+			}
+			$key = mb_strtolower($value, 'UTF-8');
+			if (isset($label_map[$key])) {
+				return $label_map[$key];
+			}
+			// Unrecognized value: return empty (= "Sélectionnez n'importe qui")
+			return '';
+		}
+
+		if ($meta_key === '_wf_fedex_custom_declared_value') {
+			$normalized = str_replace(',', '.', $value);
+			if (is_numeric($normalized)) {
+				return (string)(float)$normalized;
+			}
+			return '';
+		}
+
+		// For all other meta keys, return value unchanged
+		return $value;
+	}
+
+	/**
+	 * Reduce an HTML string (or plain text with newlines) to normalized plain text
+	 * for comparison purposes only. Converts block-level tags and <br> to newlines,
+	 * strips remaining tags, decodes HTML entities, collapses whitespace.
+	 */
+	private function normalize_html_for_comparison($value)
+	{
+		$value = (string) $value;
+
+		// Replace <br>, <br/>, <br /> with newlines
+		$value = preg_replace('/<br\s*\/?>/i', "\n", $value);
+
+		// Replace block-level closing tags with a newline so paragraphs/headings separate properly
+		$value = preg_replace('/<\/(p|div|h[1-6]|li|ul|ol|blockquote|tr)>/i', "\n", $value);
+
+		// Strip all remaining HTML tags
+		$value = wp_strip_all_tags($value);
+
+		// Decode HTML entities (&amp; &nbsp; etc.)
+		$value = html_entity_decode($value, ENT_QUOTES | ENT_HTML5, 'UTF-8');
+
+		// Replace non-breaking spaces with regular spaces
+		$value = str_replace("\xc2\xa0", ' ', $value);
+
+		// Collapse runs of spaces/tabs on each line
+		$value = preg_replace('/[ \t]+/u', ' ', $value);
+
+		// Trim each line individually
+		$lines = explode("\n", $value);
+		$lines = array_map('trim', $lines);
+
+		// Remove leading/trailing blank lines and collapse multiple blank lines into one
+		$result = [];
+		$blank_streak = 0;
+		foreach ($lines as $line) {
+			if ($line === '') {
+				$blank_streak++;
+				if ($blank_streak === 1 && !empty($result)) {
+					$result[] = '';
+				}
+			} else {
+				$blank_streak = 0;
+				$result[] = $line;
+			}
+		}
+
+		return trim(implode("\n", $result));
+	}
+
+	/**
+	 * Helper to safely extract attribute values from a raw sheet row, 
+	 * ignoring accents, case, and singular/plural ('s').
+	 */
+	private function extract_attribute_from_raw($raw_item, $col_name, &$matched_col = null)
+	{
+		if (isset($raw_item[$col_name]) && trim($raw_item[$col_name]) !== '') {
+			$matched_col = $col_name;
+			return trim($raw_item[$col_name]);
+		}
+
+		$norm = function ($s) {
+			$s = mb_strtolower(trim($s), 'UTF-8');
+			$s = str_replace(['é', 'è', 'ê', 'ë'], 'e', $s);
+			$s = str_replace(['à', 'â', 'ä'], 'a', $s);
+			$s = rtrim($s, 's'); // remove trailing 's' for plural matching
+			return $s;
+		};
+
+		$target = $norm($col_name);
+
+		foreach ($raw_item as $k => $v) {
+			if ($norm($k) === $target) {
+				$matched_col = $k;
+				return trim($v);
+			}
+		}
+		return '';
+	}
+
+	private function aggregate_parent_attributes($sku)
+	{
+		global $wpdb;
+		$attr_columns = ['Taille', 'Couleur', 'Modèle', 'Année'];
+		$attributes = [];
+		$attr_settings = [];
+
+		$children = $wpdb->get_results($wpdb->prepare("SELECT diff_data FROM {$this->table_name} WHERE diff_data LIKE %s AND diff_data LIKE %s", '%"type":"variation"%', '%"parent_sku":"' . esc_sql($sku) . '"%'));
+
+		foreach ($children as $child) {
+			$child_diff = json_decode($child->diff_data, true);
+			$child_raw = $child_diff['raw'] ?? [];
+
+			foreach ($attr_columns as $col) {
+				$matched_col = null;
+				$val = $this->extract_attribute_from_raw($child_raw, $col, $matched_col);
+				if (!empty($val)) {
+					$tax_name = wc_attribute_taxonomy_name($matched_col);
+
+					if (!isset($attributes[$tax_name])) {
+						$attributes[$tax_name] = [];
+					}
+					if (!in_array($val, $attributes[$tax_name])) {
+						$attributes[$tax_name][] = $val;
+					}
+
+					if (!isset($attr_settings[$tax_name])) {
+						$attr_settings[$tax_name] = [
+							'target' => $tax_name,
+							'visible' => true
+						];
+						if ($col === 'Taille' || $col === 'Tailles') {
+							$attr_settings[$tax_name]['variation'] = true;
+						}
+					}
+				}
+			}
+		}
+
+		return ['attributes' => $attributes, 'attr_settings' => $attr_settings];
+	}
+
+	private function format_raw_for_upsert($raw)
+	{
+		$mapping = $this->get_hardcoded_mapping();
+		$item = [
+			'wp_id'             => $raw[$mapping['wp_id']] ?? '',
+			'type'              => $raw[$mapping['type']] ?? '',
+			'sku'               => $raw[$mapping['sku']] ?? '',
+			'parent_sku'        => $raw[$mapping['parent_sku']] ?? '',
+			'title'             => $raw[$mapping['title']] ?? '',
+			'description'       => $raw[$mapping['description']] ?? '',
+			'short_description' => $raw[$mapping['short_description']] ?? '',
+			'price'             => $raw[$mapping['price']] ?? '',
+			'stock'             => $raw[$mapping['stock']] ?? '',
+			'weight'            => $raw[$mapping['weight']] ?? '',
+			'status'            => $raw[$mapping['status']] ?? '',
+			'title_en'          => $raw[$mapping['title_en']] ?? '',
+			'description_en'    => $raw[$mapping['description_en']] ?? '',
+			'content_en'        => $raw[$mapping['content_en']] ?? '',
+			'cat_primary'       => $raw[$mapping['cat_primary'] ?? 'Catégorie principale'] ?? '',
+			'cat_secondary'     => $raw[$mapping['cat_secondary'] ?? 'Catégorie secondaire'] ?? '',
+			'shipping_class'    => $raw[$mapping['shipping_class'] ?? "Classe d'expédition"] ?? '',
+			'attributes'        => [],
+			'attr_settings'     => [],
+			'custom_meta'       => [],
+		];
+
+		$type = strtolower(trim($item['type']));
+		if ($type === 'variable') {
+			$aggregated = $this->aggregate_parent_attributes($item['sku']);
+			$item['attributes'] = $aggregated['attributes'];
+			$item['attr_settings'] = $aggregated['attr_settings'];
+		} else {
+			$attr_columns = ['Taille', 'Couleur', 'Modèle', 'Année'];
+			foreach ($attr_columns as $col) {
+				$matched_col = null;
+				$val = $this->extract_attribute_from_raw($raw, $col, $matched_col);
+				if (!empty($val)) {
+					$tax_name = wc_attribute_taxonomy_name($matched_col);
+
+					if ($type === 'variation') {
+						$item['attributes'][$tax_name] = $val;
+					} else {
+						$item['attributes'][$tax_name] = array_filter(array_map('trim', explode(',', $val)));
+					}
+
+					$item['attr_settings'][$tax_name] = [
+						'target' => $tax_name,
+						'visible' => true
+					];
+					if ($col === 'Taille') {
+						$item['attr_settings'][$tax_name]['variation'] = true;
+					}
+				}
+			}
+		}
+
+		return $item;
+	}
+
+	/**
+	 * Create Custom DB Table on Activation
+	 */
+	public static function activate()
+	{
+		global $wpdb;
+		$table_name = $wpdb->prefix . 'mjf_gsheet_sync_queue';
+		$charset_collate = $wpdb->get_charset_collate();
+
+		$sql = "CREATE TABLE $table_name (
+			id bigint(20) NOT NULL AUTO_INCREMENT,
+			sku varchar(255) NOT NULL,
+			product_id bigint(20) DEFAULT NULL,
+			gs_row_index int(11) DEFAULT NULL,
+			status varchar(50) DEFAULT 'pending',
+			diff_data longtext DEFAULT NULL,
+			direction varchar(10) DEFAULT NULL,
+			created_at datetime DEFAULT CURRENT_TIMESTAMP,
+			updated_at datetime DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+			PRIMARY KEY  (id),
+			UNIQUE KEY sku (sku)
+		) $charset_collate;";
+
+		require_once(ABSPATH . 'wp-admin/includes/upgrade.php');
+		dbDelta($sql);
+	}
+
+	private function find_attachment_by_base_name($base_name)
+	{
+		global $wpdb;
+		// WP saves relative path in _wp_attached_file, e.g. "2026/05/slug.jpg"
+		// We look for anything ending with "slug.extension"
+		$query = $wpdb->prepare(
+			"SELECT post_id FROM {$wpdb->postmeta} WHERE meta_key = '_wp_attached_file' AND meta_value LIKE %s ORDER BY post_id DESC LIMIT 1",
+			'%' . $wpdb->esc_like($base_name) . '.%'
+		);
+		return $wpdb->get_var($query);
+	}
+
+	private function set_product_shipping_class(&$product, $shipping_class_name)
+	{
+		$sku = $product->get_sku();
+		if (empty($shipping_class_name) || strtolower(trim($shipping_class_name)) === 'aucune') {
+			$product->set_shipping_class_id(0);
+			if ($product->get_id()) {
+				wp_set_object_terms($product->get_id(), array(), 'product_shipping_class');
+			}
+			return;
+		}
+
+		global $sitepress;
+		$original_lang = null;
+		if (isset($sitepress)) {
+			$original_lang = $sitepress->get_current_language();
+			$sitepress->switch_lang('fr');
+		}
+
+		$this->log(sprintf('Attempting to set shipping class "%s" for product %s', $shipping_class_name, $sku));
+		
+		$term_id = 0;
+		$classes = WC()->shipping()->get_shipping_classes();
+		foreach ($classes as $sc) {
+			if (strcasecmp(trim($sc->name), trim($shipping_class_name)) === 0 || strcasecmp(trim($sc->slug), sanitize_title($shipping_class_name)) === 0) {
+				$term_id = absint($sc->term_id);
+				break;
+			}
+		}
+
+		if ($term_id) {
+			$this->log(sprintf('Found existing shipping class term id %d', $term_id));
+		} else {
+			$this->log(sprintf('Creating new shipping class term %s', $shipping_class_name));
+			$term_data = wp_insert_term($shipping_class_name, 'product_shipping_class');
+			if (! is_wp_error($term_data)) {
+				$term_id = absint($term_data['term_id']);
+				$this->log(sprintf('Created term id %d', $term_id));
+			} else {
+				$this->log('Failed to create term: ' . $term_data->get_error_message());
+				// If it failed because it exists (e.g. cached), try one more time by exact slug
+				if ($term_data->get_error_code() === 'term_exists') {
+					$existing_term_id = $term_data->get_error_data();
+					$term_id = absint($existing_term_id);
+					$this->log(sprintf('Recovered existing term id %d', $term_id));
+				}
+			}
+		}
+
+		if ($term_id > 0) {
+			$product->set_shipping_class_id($term_id);
+			if ($product->get_id()) {
+				wp_set_object_terms($product->get_id(), $term_id, 'product_shipping_class');
+			}
+		}
+
+		if (isset($sitepress) && $original_lang) {
+			$sitepress->switch_lang($original_lang);
+		}
+	}
+
+	private function normalize_attribute_label($label)
+	{
+		$label = mb_strtolower(trim($label), 'UTF-8');
+		$label = str_replace(['é', 'è', 'ê', 'ë'], 'e', $label);
+		$label = str_replace(['à', 'â', 'ä'], 'a', $label);
+		$label = rtrim($label, 's'); // Singular/plural matching (e.g. Tailles -> taille)
+
+		$synonyms = [
+			'annee d\'edition' => 'annee',
+			'annee dedition'   => 'annee',
+			'annee d’edition'  => 'annee',
+			'tailles'          => 'taille',
+			'modele'           => 'modele',
+			'couleur'          => 'couleur',
+		];
+
+		if (isset($synonyms[$label])) {
+			return $synonyms[$label];
+		}
+
+		return $label;
+	}
+
+	private function normalize_attribute_value($val)
+	{
+		$val = html_entity_decode((string)$val, ENT_QUOTES, 'UTF-8');
+		$val = preg_replace('/\s+/u', ' ', trim($val));
+		return mb_strtolower($val, 'UTF-8');
+	}
+
+	private function get_attribute_display_label($norm_label)
+	{
+		$display_labels = [
+			'annee'   => 'Année',
+			'taille'  => 'Tailles',
+			'modele'  => 'Modèle',
+			'couleur' => 'Couleur',
+		];
+
+		if (isset($display_labels[$norm_label])) {
+			return $display_labels[$norm_label];
+		}
+
+		return ucfirst($norm_label);
+	}
+
+	/**
+	 * Sync stock quantity to Google Sheets when an order is completed.
+	 */
+	public function sync_stock_to_gsheet_on_order_completed($order_id)
+	{
+		$order = wc_get_order($order_id);
+		if (!$order) return;
+
+		global $wpdb;
+		$mapping = $this->get_hardcoded_mapping();
+		$stock_col = $mapping['stock'] ?? 'Stock';
+
+		foreach ($order->get_items() as $item) {
+			$product = $item->get_product();
+			if (!$product) continue;
+
+			$product_id = $product->get_id();
+			$post_type = $product->is_type('variation') ? 'product_variation' : 'product';
+
+			// Resolve translation to original French product if WPML is active
+			$original_id = apply_filters('wpml_object_id', $product_id, $post_type, true, 'fr');
+			$original_product = wc_get_product($original_id);
+			if (!$original_product) {
+				$original_product = $product;
+			}
+
+			// Check if stock management is enabled for this product/variation
+			if (!$original_product->managing_stock()) {
+				continue;
+			}
+
+			$sku = $original_product->get_sku();
+			if (empty($sku)) continue;
+
+			// Get current WooCommerce stock quantity
+			$stock_qty = $original_product->get_stock_quantity();
+
+			// Look up in sync queue table to find Google Sheet row index
+			$row = $wpdb->get_row($wpdb->prepare(
+				"SELECT gs_row_index FROM {$this->table_name} WHERE sku = %s",
+				$sku
+			));
+
+			if ($row && !empty($row->gs_row_index)) {
+				if ($stock_col) {
+					$this->api->write_to_google_sheet($row->gs_row_index, $stock_col, $stock_qty);
+					$this->log(sprintf('Stock updated in GSheet for order %d: Product %d -> %d', $order_id, $original_id, $stock_qty));
+				}
+			}
 		}
 	}
 }
 
 // Initialize the plugin
+register_activation_hook(__FILE__, ['MJF_GSheet_Product_Importer', 'activate']);
 new MJF_GSheet_Product_Importer();

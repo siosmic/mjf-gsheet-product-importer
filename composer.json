@@ -1,0 +1,27 @@
+{
+    "name": "mjf/gsheet-product-importer",
+    "description": "Import and sync WooCommerce products from a Google Sheet.",
+    "type": "wordpress-plugin",
+    "require": {
+        "google/apiclient": "^2.15.0",
+        "monolog/monolog": "^2.9"
+    },
+    "autoload": {
+        "psr-4": {
+            "MJF\\GSheetImporter\\": "includes/"
+        }
+    },
+    "scripts": {
+        "post-update-cmd": [
+            "Google\\Task\\Composer::cleanup"
+        ],
+        "post-install-cmd": [
+            "Google\\Task\\Composer::cleanup"
+        ]
+    },
+    "extra": {
+        "google/apiclient-services": [
+            "Sheets"
+        ]
+    }
+}

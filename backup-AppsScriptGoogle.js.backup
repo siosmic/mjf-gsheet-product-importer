@@ -1,0 +1,48 @@
+function onEdit(e) {
+  var sheet = e.source.getActiveSheet();
+  var range = e.range;
+
+  // Paramètres de configuration
+  var nomFeuille = "PRODUITS";
+  var colPrincipale = 14; // Colonne N
+  var colSecondaire = 15; // Colonne O
+  var ligneDebut = 3; // Commence à la ligne 3
+
+  // 1. Vérifie que nous sommes sur la bonne feuille et la bonne colonne (L)
+  if (
+    sheet.getName() == nomFeuille &&
+    range.getColumn() == colPrincipale &&
+    range.getRow() >= ligneDebut
+  ) {
+    var categorieSelectionnee = e.value;
+    var celluleSecondaire = range.offset(0, 1); // Décalage de 1 vers la droite -> Colonne M
+
+    // Si on efface la catégorie principale, on vide la secondaire
+    if (!categorieSelectionnee) {
+      celluleSecondaire.clearDataValidations();
+      celluleSecondaire.setValue("");
+      return;
+    }
+
+    // Préparation du nom de la plage (nettoyage des caractères spéciaux)
+    // On remplace les espaces et les tirets par des underscores pour correspondre aux Plages Nommées
+    var nomPlage = categorieSelectionnee.replace(/[\s\-]+/g, "_");
+
+    try {
+      var plageSource = e.source.getRangeByName(nomPlage);
+
+      if (plageSource) {
+        var regle = SpreadsheetApp.newDataValidation()
+          .requireValueInRange(plageSource, true)
+          .setAllowInvalid(false)
+          .build();
+        celluleSecondaire.setDataValidation(regle);
+      } else {
+        // Si aucune plage nommée ne correspond, on retire la validation
+        celluleSecondaire.clearDataValidations();
+      }
+    } catch (error) {
+      celluleSecondaire.clearDataValidations();
+    }
+  }
+}
