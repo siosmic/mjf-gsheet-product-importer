@@ -21,6 +21,7 @@ if (file_exists(dirname(__FILE__) . '/vendor/autoload.php')) {
 	require_once dirname(__FILE__) . '/vendor/autoload.php';
 }
 
+require_once dirname(__FILE__) . '/includes/class-mjf-gsheet-logger.php';
 require_once dirname(__FILE__) . '/includes/class-mjf-gsheet-api.php';
 require_once dirname(__FILE__) . '/includes/class-mjf-gsheet-admin.php';
 
@@ -44,6 +45,8 @@ class MJF_GSheet_Product_Importer
 		$this->api = new MJF_GSheet_API();
 		$this->admin = new MJF_GSheet_Admin();
 
+		MJF_GSheet_Logger::ensure_table_exists();
+
 		if ($wpdb->get_var("SHOW TABLES LIKE '{$this->table_name}'") !== $this->table_name) {
 			self::activate();
 		}
@@ -60,8 +63,16 @@ class MJF_GSheet_Product_Importer
 		add_action('wp_ajax_mjf_gsheet_create_product', [$this, 'ajax_create_product']);
 		add_action('wp_ajax_mjf_gsheet_create_translation', [$this, 'ajax_create_translation']);
 
+		// Logs AJAX Endpoints
+		add_action('wp_ajax_mjf_gsheet_get_logs', [$this, 'ajax_get_logs']);
+		add_action('wp_ajax_mjf_gsheet_clear_logs', [$this, 'ajax_clear_logs']);
+		add_action('wp_ajax_mjf_gsheet_export_logs', [$this, 'ajax_export_logs']);
+
 		// Order Completed hook for Stock Sync WP -> GS
 		add_action('woocommerce_order_status_completed', [$this, 'sync_stock_to_gsheet_on_order_completed'], 10, 1);
+
+		// Settings change hook
+		add_action('update_option_mjf_gsheet_importer_settings', [$this, 'log_settings_update'], 10, 2);
 
 		add_filter('plugin_action_links_' . plugin_basename(__FILE__), [$this->admin, 'add_action_links']);
 	}
@@ -69,8 +80,10 @@ class MJF_GSheet_Product_Importer
 	/**
 	 * Log message
 	 */
-	private function log($message)
+	public function log($message, $level = 'info', $action = 'general', $context = [])
 	{
+		MJF_GSheet_Logger::log($level, $message, $action, $context);
+
 		$logs = get_option('mjf_gsheet_import_logs', []);
 		$logs[] = [
 			'time'    => current_time('Y-m-d H:i:s'),
@@ -252,8 +265,16 @@ class MJF_GSheet_Product_Importer
 
 		$variation = $variation_id ? new WC_Product_Variation($variation_id) : new WC_Product_Variation();
 
-		// Description and Short Description (NOT INHERITED OR SAVED ON VARIATION)
-		// User specifically requested not to save descriptions on variations.
+		// Variation Description (saved on variation if provided)
+		$var_desc = '';
+		if (!empty($item['short_description'])) {
+			$var_desc = $item['short_description'];
+		} elseif (!empty($item['description'])) {
+			$var_desc = $item['description'];
+		}
+		if (!empty($var_desc)) {
+			$variation->set_description($var_desc);
+		}
 
 		$variation->set_parent_id($parent_id);
 		$variation->set_sku($sku);
@@ -1013,10 +1034,33 @@ class MJF_GSheet_Product_Importer
 		}
 
 		if ($type === 'variation') {
-			// Variations in WC inherit descriptions and don't have unique titles
+			// Variations in WC don't have unique titles
 			unset($fields_to_compare['title']);
 			unset($fields_to_compare['description']);
 			unset($fields_to_compare['short_description']);
+
+			// Check variation description:
+			// In GS, the variation description can be in 'Description FR' (short_description) or 'Contenu additionel FR' (description).
+			$gs_var_desc = '';
+			$desc_col = $mapping['short_description'] ?? 'Description FR';
+			if (!empty($raw_item[$desc_col])) {
+				$gs_var_desc = $raw_item[$desc_col];
+			} elseif (!empty($raw_item[$mapping['description'] ?? 'Contenu additionel FR'])) {
+				$desc_col = $mapping['description'] ?? 'Contenu additionel FR';
+				$gs_var_desc = $raw_item[$desc_col];
+			}
+
+			$wp_var_desc = $product->get_description();
+
+			$gs_plain = $this->normalize_html_for_comparison($gs_var_desc);
+			$wp_plain = $this->normalize_html_for_comparison($wp_var_desc);
+
+			if ((!empty($gs_plain) || !empty($wp_plain)) && $gs_plain !== $wp_plain) {
+				$diff['description'] = [
+					'gs' => trim($gs_var_desc),
+					'wp' => trim($wp_var_desc)
+				];
+			}
 		}
 
 		foreach ($fields_to_compare as $key => $meta) {
@@ -1307,6 +1351,36 @@ class MJF_GSheet_Product_Importer
 		// WPML EN
 		$post_type_wpml = ($type === 'variation') ? 'product_variation' : 'product';
 		$translated_id = apply_filters('wpml_object_id', $product_id, $post_type_wpml, false, 'en');
+
+		// For variations, check alternative WPML formats, database translation records and WCML postmeta
+		if ($type === 'variation' && (!$translated_id || $translated_id == $product_id)) {
+			$translated_id = apply_filters('wpml_object_id', $product_id, 'post_product_variation', false, 'en');
+			if (!$translated_id || $translated_id == $product_id) {
+				global $wpdb;
+				$tr_var_id = $wpdb->get_var($wpdb->prepare(
+					"SELECT t.element_id FROM {$wpdb->prefix}icl_translations s
+					 JOIN {$wpdb->prefix}icl_translations t ON s.trid = t.trid AND t.language_code = 'en'
+					 WHERE s.element_id = %d AND s.element_type = 'post_product_variation' LIMIT 1",
+					$product_id
+				));
+				if ($tr_var_id) {
+					$translated_id = (int)$tr_var_id;
+				} else {
+					$wcml_dup = $wpdb->get_var($wpdb->prepare(
+						"SELECT post_id FROM {$wpdb->postmeta} WHERE meta_key = '_wcml_duplicate_of_variation' AND meta_value = %d LIMIT 1",
+						$product_id
+					));
+					if ($wcml_dup) {
+						$translated_id = (int)$wcml_dup;
+					}
+				}
+			}
+		}
+
+		if ($translated_id == $product_id) {
+			$translated_id = 0;
+		}
+
 		$wpml_map = [
 			'title_en'       => $mapping['title_en'] ?? 'Nom du produit EN',
 			'description_en' => $mapping['description_en'] ?? 'Contenu additionel EN',
@@ -1366,8 +1440,13 @@ class MJF_GSheet_Product_Importer
 
 		@ini_set('memory_limit', '512M');
 
+		MJF_GSheet_Logger::info(__('Starting Google Sheets ↔ WooCommerce synchronization / comparison...', 'mjf-gsheet-importer'), 'import_gs_wp');
+
 		$data = $this->api->fetch_sheet_data();
-		if (is_wp_error($data)) wp_send_json_error($data->get_error_message());
+		if (is_wp_error($data)) {
+			MJF_GSheet_Logger::error(sprintf(__('Analysis failed: unable to fetch Google Sheets data (%s).', 'mjf-gsheet-importer'), $data->get_error_message()), 'import_gs_wp');
+			wp_send_json_error($data->get_error_message());
+		}
 
 		global $wpdb;
 		$table_name = $this->table_name;
@@ -1530,6 +1609,12 @@ class MJF_GSheet_Product_Importer
 		}
 
 		error_log("Finished processing. Inserted: $inserted");
+
+		MJF_GSheet_Logger::success(
+			sprintf(__('Comparison analysis complete: %d sheet rows analyzed, %d items require action / sync.', 'mjf-gsheet-importer'), count($rows), $inserted),
+			'import_gs_wp',
+			['total_sheet_rows' => count($rows), 'queue_items_inserted' => $inserted]
+		);
 
 		wp_send_json_success(['message' => "Comparison generated successfully. Processed {$inserted} items from the sheet."]);
 	}
@@ -1736,8 +1821,8 @@ class MJF_GSheet_Product_Importer
 					echo '<button class="button" disabled>Créer dans WooCommerce</button>';
 				} else {
 					echo '<p style="margin:0 0 12px; color:#46b450;"><span class="dashicons dashicons-yes-alt"></span> Toutes les données requises sont présentes.</p>';
-					echo '<button class="button button-primary mjf-create-product-btn" data-id="' . esc_attr($item->id) . '">';
-					echo '<span class="dashicons dashicons-plus-alt" style="font-size:16px; width:16px; height:16px; line-height:16px; vertical-align:middle; margin-top:-2px;"></span> Créer dans WooCommerce</button>';
+					echo '<button class="button button-primary mjf-create-product-btn mjf-btn-with-icon" data-id="' . esc_attr($item->id) . '">';
+					echo '<span class="dashicons dashicons-plus-alt"></span> <span>Créer dans WooCommerce</span></button>';
 				}
 				echo '</div>';
 				return;
@@ -1756,8 +1841,8 @@ class MJF_GSheet_Product_Importer
 					} else {
 						echo '<p style="margin:0 0 12px; color:#666;">Le produit existe en Français mais n\'a pas encore de traduction Anglaise dans WooCommerce.</p>';
 					}
-					echo '<button class="button button-primary mjf-create-translation-btn" data-id="' . esc_attr($item->id) . '">';
-					echo '<span class="dashicons dashicons-plus-alt" style="font-size:16px; width:16px; height:16px; line-height:16px; vertical-align:middle; margin-top:-2px;"></span> Créer la traduction Anglaise</button>';
+					echo '<button class="button button-primary mjf-create-translation-btn mjf-btn-with-icon" data-id="' . esc_attr($item->id) . '">';
+					echo '<span class="dashicons dashicons-plus-alt"></span> <span>Créer la traduction Anglaise</span></button>';
 				}
 				echo '</div>';
 				unset($diffs['wpml_missing']);
@@ -1775,6 +1860,8 @@ class MJF_GSheet_Product_Importer
 						$label = 'Image principale';
 					} elseif ($field === 'image_gallery') {
 						$label = 'Galerie d\'images';
+					} elseif ($field === 'description' && $type === 'variation') {
+						$label = 'Description (Variation)';
 					}
 					echo '<td style="width:15%; padding:8px; border-bottom:1px solid #ccd0d4;"><strong>' . esc_html($label) . '</strong></td>';
 
@@ -1785,8 +1872,8 @@ class MJF_GSheet_Product_Importer
 					echo '<td style="width:35%; background:#ffeef0; padding:8px; word-break:break-word; font-size:12px; border-bottom:1px solid #ccd0d4;">' . wp_kses_post($wp_render) . '</td>';
 					echo '<td style="width:15%; padding:8px; text-align:center; border-bottom:1px solid #ccd0d4;">';
 					echo '<div style="display:flex; flex-direction: column; gap:5px; justify-content:center;">';
-					echo '<button class="button button-small mjf-inline-sync-btn" data-id="' . $item->id . '" data-field="' . esc_attr($field) . '" data-dir="gs_to_wp"><span class="dashicons dashicons-arrow-down-alt" style="font-size:16px; width:16px; height:16px; line-height:16px; vertical-align:middle; margin-top:-2px;"></span> Import from Google Sheet</button>';
-					echo '<button class="button button-small mjf-inline-sync-btn" data-id="' . $item->id . '" data-field="' . esc_attr($field) . '" data-dir="wp_to_gs"><span class="dashicons dashicons-arrow-up-alt" style="font-size:16px; width:16px; height:16px; line-height:16px; vertical-align:middle; margin-top:-2px;"></span> Push to Google Sheet</button>';
+					echo '<button class="button button-small mjf-inline-sync-btn mjf-btn-with-icon" data-id="' . $item->id . '" data-field="' . esc_attr($field) . '" data-dir="gs_to_wp"><span class="dashicons dashicons-arrow-down-alt"></span> <span>Import from Google Sheet</span></button>';
+					echo '<button class="button button-small mjf-inline-sync-btn mjf-btn-with-icon" data-id="' . $item->id . '" data-field="' . esc_attr($field) . '" data-dir="wp_to_gs"><span class="dashicons dashicons-arrow-up-alt"></span> <span>Push to Google Sheet</span></button>';
 					echo '</div></td>';
 					echo '</tr>';
 				}
@@ -1827,6 +1914,28 @@ class MJF_GSheet_Product_Importer
 				$post_type = $is_variation ? 'product_variation' : 'product';
 				$has_fr = apply_filters('wpml_object_id', $item->product_id, $post_type, false, 'fr');
 				$has_en = apply_filters('wpml_object_id', $item->product_id, $post_type, false, 'en');
+
+				if ($is_variation && (!$has_en || $has_en == $item->product_id)) {
+					$has_en = apply_filters('wpml_object_id', $item->product_id, 'post_product_variation', false, 'en');
+					if (!$has_en || $has_en == $item->product_id) {
+						global $wpdb;
+						$has_en = $wpdb->get_var($wpdb->prepare(
+							"SELECT t.element_id FROM {$wpdb->prefix}icl_translations s
+							 JOIN {$wpdb->prefix}icl_translations t ON s.trid = t.trid AND t.language_code = 'en'
+							 WHERE s.element_id = %d AND s.element_type = 'post_product_variation' LIMIT 1",
+							$item->product_id
+						));
+						if (!$has_en) {
+							$has_en = $wpdb->get_var($wpdb->prepare(
+								"SELECT post_id FROM {$wpdb->postmeta} WHERE meta_key = '_wcml_duplicate_of_variation' AND meta_value = %d LIMIT 1",
+								$item->product_id
+							));
+						}
+					}
+				}
+				if ($has_en == $item->product_id) {
+					$has_en = 0;
+				}
 
 				$fr_style = $has_fr ? 'background:#46b450; color:#fff;' : 'background:#eee; color:#aaa;';
 				$en_style = $has_en ? 'background:#46b450; color:#fff;' : 'background:#eee; color:#aaa;';
@@ -1970,7 +2079,7 @@ class MJF_GSheet_Product_Importer
 
 						echo '<h4 style="margin-top:20px; margin-bottom:10px;">Variations</h4>';
 						if ($has_missing_translations) {
-							echo '<button class="button button-small mjf-create-translation-btn" data-id="' . esc_attr($missing_var_id) . '" style="margin-bottom:10px;"><span class="dashicons dashicons-translation" style="font-size:14px; width:14px; height:14px; line-height:14px; vertical-align:middle; margin-top:-2px; color:#2271b1;"></span> Générer les traductions EN manquantes</button>';
+							echo '<button class="button button-small mjf-create-translation-btn mjf-btn-with-icon" data-id="' . esc_attr($missing_var_id) . '" style="margin-bottom:10px;"><span class="dashicons dashicons-translation" style="color:#2271b1;"></span> <span>Générer les traductions EN manquantes</span></button>';
 						}
 						echo '<table class="wp-list-table widefat" style="margin-bottom:20px; border:1px solid #eee;">';
 						echo '<thead><tr><th style="width:100px;">WP ID</th><th style="width:150px;">SKU</th><th>Variation (Attributs)</th><th style="width:100px;">Langues</th><th style="text-align:center; width:100px;">Status</th><th style="width:40px;"></th></tr></thead>';
@@ -2025,15 +2134,40 @@ class MJF_GSheet_Product_Importer
 
 		if ($direction === 'gs_to_wp') {
 			if ($field === 'stock' && $row->product_id) {
-				wp_send_json_error('L\'importation du stock depuis Google Sheet est bloquée pour les produits existants afin de préserver les données de vente.');
+				MJF_GSheet_Logger::warning(
+					sprintf(__('SKU %s: Stock import from Google Sheets to WooCommerce was blocked (existing product ID %d).', 'mjf-gsheet-importer'), $row->sku, $row->product_id),
+					'import_gs_wp'
+				);
+				wp_send_json_error('Stock import from Google Sheets is blocked for existing products to preserve sales data.');
 			}
 			$this->sync_field_to_wp($row->product_id, $field, $vals['gs'], $raw_item);
+			MJF_GSheet_Logger::success(
+				sprintf(__('SKU %s (ID %d): Field "%s" synced from Google Sheets to WooCommerce (Value: "%s").', 'mjf-gsheet-importer'), $row->sku, $row->product_id, $field, is_scalar($vals['gs']) ? mb_strimwidth((string)$vals['gs'], 0, 80, '...') : '[complex]'),
+				'import_gs_wp',
+				['sku' => $row->sku, 'product_id' => $row->product_id, 'field' => $field, 'value' => $vals['gs']]
+			);
 		} else if ($direction === 'wp_to_gs') {
 			$gs_col = $mapping[$field] ?? $field;
+			if ($field === 'description' && ($diff_data['type'] ?? '') === 'variation') {
+				$short_col = $mapping['short_description'] ?? 'Description FR';
+				if (isset($raw_item[$short_col]) && (!empty($raw_item[$short_col]) || empty($raw_item[$mapping['description'] ?? 'Contenu additionel FR'] ?? ''))) {
+					$gs_col = $short_col;
+				}
+			}
 			// Write to sheet
 			$result = $this->api->write_to_google_sheet($row->gs_row_index, $gs_col, $vals['wp']);
 			if (is_wp_error($result)) {
+				MJF_GSheet_Logger::error(
+					sprintf(__('SKU %s: Error while syncing field "%s" to Google Sheets: %s', 'mjf-gsheet-importer'), $row->sku, $field, $result->get_error_message()),
+					'export_wp_gs'
+				);
 				wp_send_json_error($result->get_error_message());
+			} else {
+				MJF_GSheet_Logger::success(
+					sprintf(__('SKU %s (ID %d): Field "%s" synced from WooCommerce to Google Sheets (column "%s", row %d).', 'mjf-gsheet-importer'), $row->sku, $row->product_id, $field, $gs_col, $row->gs_row_index),
+					'export_wp_gs',
+					['sku' => $row->sku, 'product_id' => $row->product_id, 'field' => $field, 'value' => $vals['wp']]
+				);
 			}
 		}
 
@@ -2119,6 +2253,12 @@ class MJF_GSheet_Product_Importer
 		$wp_status = $status_map[strtolower($status)] ?? 'draft';
 
 		try {
+			MJF_GSheet_Logger::info(
+				sprintf(__('Création d\'un produit dans WooCommerce : SKU %s (type: %s, titre: "%s")...', 'mjf-gsheet-importer'), $sku, $type_raw, $title),
+				'create_product',
+				['sku' => $sku, 'type' => $type_raw, 'title' => $title]
+			);
+
 			if ($type_raw === 'variation') {
 				// Create as variation of an existing parent
 				$parent_id = 0;
@@ -2138,7 +2278,13 @@ class MJF_GSheet_Product_Importer
 					}
 				}
 
-				if (!$parent_id) wp_send_json_error('Produit parent introuvable dans WooCommerce.');
+				if (!$parent_id) {
+					MJF_GSheet_Logger::error(
+						sprintf(__('Création variation SKU %s impossible : produit parent SKU %s introuvable dans WooCommerce.', 'mjf-gsheet-importer'), $sku, $parent_sku),
+						'create_product'
+					);
+					wp_send_json_error('Produit parent introuvable dans WooCommerce.');
+				}
 
 				$variation = new WC_Product_Variation();
 				$variation->set_parent_id($parent_id);
@@ -2157,6 +2303,15 @@ class MJF_GSheet_Product_Importer
 					$variation->set_stock_quantity(0);
 				}
 				if (!empty($weight)) $variation->set_weight((float) str_replace(',', '.', $weight));
+
+				// Set Variation Description
+				$var_desc = !empty($short_desc) ? $short_desc : $description;
+				if (empty($var_desc)) {
+					$var_desc = $raw['Description FR'] ?? $raw['Contenu additionel FR'] ?? '';
+				}
+				if (!empty($var_desc)) {
+					$variation->set_description($var_desc);
+				}
 
 				// Set Attributes
 				$parent_product = wc_get_product($parent_id);
@@ -2314,7 +2469,12 @@ class MJF_GSheet_Product_Importer
 			}
 
 			if (!$new_id || is_wp_error($new_id)) {
-				wp_send_json_error('Échec lors de la sauvegarde du produit dans WooCommerce.');
+				$save_err = is_wp_error($new_id) ? $new_id->get_error_message() : 'Unknown error';
+				MJF_GSheet_Logger::error(
+					sprintf(__('Failed to save product SKU %s in WooCommerce: %s', 'mjf-gsheet-importer'), $sku, $save_err),
+					'create_product'
+				);
+				wp_send_json_error('Failed to save product in WooCommerce.');
 			}
 
 			// Force WPML language to FR for the newly created product
@@ -2354,6 +2514,11 @@ class MJF_GSheet_Product_Importer
 			$wp_id_col = $mapping['wp_id'] ?? 'WP ID';
 			if ($wp_id_col) {
 				$this->api->write_to_google_sheet($row->gs_row_index, $wp_id_col, $new_id);
+				MJF_GSheet_Logger::info(
+					sprintf(__('Updated WP ID column (%d) in Google Sheets for SKU %s (row %d).', 'mjf-gsheet-importer'), $new_id, $sku, $row->gs_row_index),
+					'export_wp_gs',
+					['sku' => $sku, 'product_id' => $new_id, 'row_index' => $row->gs_row_index]
+				);
 			}
 
 			// Refresh this item status
@@ -2376,11 +2541,22 @@ class MJF_GSheet_Product_Importer
 				$sitepress->switch_lang($original_lang);
 			}
 
-			wp_send_json_success(['message' => 'Produit créé avec succès (ID: ' . $new_id . ').']);
+			MJF_GSheet_Logger::success(
+				sprintf(__('Product created successfully in WooCommerce: SKU %s, WooCommerce ID: %d (type: %s).', 'mjf-gsheet-importer'), $sku, $new_id, $type_raw),
+				'create_product',
+				['sku' => $sku, 'product_id' => $new_id, 'type' => $type_raw]
+			);
+
+			wp_send_json_success(['message' => 'Product created successfully (ID: ' . $new_id . ').']);
 		} catch (\Exception $e) {
 			if (isset($sitepress) && $original_lang) {
 				$sitepress->switch_lang($original_lang);
 			}
+			MJF_GSheet_Logger::error(
+				sprintf(__('Exception while creating product SKU %s: %s', 'mjf-gsheet-importer'), $sku, $e->getMessage()),
+				'create_product',
+				['sku' => $sku, 'exception' => $e->getMessage()]
+			);
 			wp_send_json_error('Exception : ' . $e->getMessage());
 		}
 	}
@@ -2401,18 +2577,30 @@ class MJF_GSheet_Product_Importer
 		$mapping = $this->get_hardcoded_mapping();
 		$sku = $item->sku;
 
+		MJF_GSheet_Logger::info(
+			sprintf(__('Creating / syncing English translation for SKU %s...', 'mjf-gsheet-importer'), $sku),
+			'create_translation',
+			['sku' => $sku, 'product_id' => $item->product_id]
+		);
+
 		$product_id = $item->product_id;
 		if (!$product_id) {
 			$product_id = wc_get_product_id_by_sku($sku);
 		}
-		if (!$product_id) wp_send_json_error('Original product (FR) not found.');
+		if (!$product_id) {
+			MJF_GSheet_Logger::error(sprintf(__('Translation for SKU %s failed: original product (FR) not found in WooCommerce.', 'mjf-gsheet-importer'), $sku), 'create_translation');
+			wp_send_json_error('Original product (FR) not found.');
+		}
 
 		$title_en = trim($raw[$mapping['title_en'] ?? 'Nom du produit EN'] ?? '');
 		$type = $diff_data['type'] ?? 'simple';
 
 		if ($type === 'variation') {
 			$parent_sku = $diff_data['parent_sku'] ?? '';
-			if (!$parent_sku) wp_send_json_error('Parent SKU not found for this variation.');
+			if (!$parent_sku) {
+				MJF_GSheet_Logger::error(sprintf(__('Variation translation for SKU %s failed: parent SKU missing.', 'mjf-gsheet-importer'), $sku), 'create_translation');
+				wp_send_json_error('Parent SKU not found for this variation.');
+			}
 
 			$parent_id = 0;
 			$parent_row = $wpdb->get_row($wpdb->prepare("SELECT product_id FROM {$this->table_name} WHERE sku = %s", $parent_sku));
@@ -2422,14 +2610,94 @@ class MJF_GSheet_Product_Importer
 			if (!$parent_id) {
 				$parent_id = wc_get_product_id_by_sku($parent_sku);
 			}
-			if (!$parent_id) wp_send_json_error('Parent product not found.');
+			if (!$parent_id) {
+				MJF_GSheet_Logger::error(sprintf(__('Variation translation for SKU %s failed: parent product not found.', 'mjf-gsheet-importer'), $sku), 'create_translation');
+				wp_send_json_error('Parent product not found.');
+			}
+
+			// Ensure the parent variable product has an English translation first
+			$tr_parent_id = apply_filters('wpml_object_id', $parent_id, 'product', false, 'en');
+			if (!$tr_parent_id || $tr_parent_id == $parent_id) {
+				$parent_entry = $wpdb->get_row($wpdb->prepare("SELECT diff_data FROM {$this->table_name} WHERE sku = %s", $parent_sku));
+				$parent_raw = [];
+				if ($parent_entry) {
+					$parent_dd = json_decode($parent_entry->diff_data, true);
+					$parent_raw = $parent_dd['raw'] ?? [];
+				}
+				$formatted_parent = $this->format_raw_for_upsert($parent_raw);
+				$tr_parent_id = $this->upsert_translation($parent_id, $formatted_parent, 'en');
+			}
+
+			// Allow WCML to synchronize in AJAX context
+			add_filter('wcml_product_synchronization_on_save_is_valid_context', '__return_true');
 
 			global $woocommerce_wpml;
 			if (isset($woocommerce_wpml) && isset($woocommerce_wpml->sync_variations_data)) {
-				$woocommerce_wpml->sync_variations_data->sync_product_variations_action($parent_id);
+				if ($tr_parent_id && method_exists($woocommerce_wpml->sync_variations_data, 'sync_product_variations')) {
+					$woocommerce_wpml->sync_variations_data->sync_product_variations($parent_id, $tr_parent_id, 'en');
+				}
+				if (method_exists($woocommerce_wpml->sync_variations_data, 'sync_product_variations_action')) {
+					$woocommerce_wpml->sync_variations_data->sync_product_variations_action($parent_id);
+				}
+			}
+
+			// Check if translated variation exists or needs manual creation
+			$translated_var_id = apply_filters('wpml_object_id', $product_id, 'product_variation', false, 'en');
+			if (!$translated_var_id || $translated_var_id == $product_id) {
+				$translated_var_id = apply_filters('wpml_object_id', $product_id, 'post_product_variation', false, 'en');
+			}
+			if (!$translated_var_id || $translated_var_id == $product_id) {
+				$translated_var_id = $wpdb->get_var($wpdb->prepare(
+					"SELECT t.element_id FROM {$wpdb->prefix}icl_translations s
+					 JOIN {$wpdb->prefix}icl_translations t ON s.trid = t.trid AND t.language_code = 'en'
+					 WHERE s.element_id = %d AND s.element_type = 'post_product_variation' LIMIT 1",
+					$product_id
+				));
+			}
+			if (!$translated_var_id) {
+				$wcml_dup = $wpdb->get_var($wpdb->prepare(
+					"SELECT post_id FROM {$wpdb->postmeta} WHERE meta_key = '_wcml_duplicate_of_variation' AND meta_value = %d LIMIT 1",
+					$product_id
+				));
+				if ($wcml_dup) {
+					$translated_var_id = (int)$wcml_dup;
+				}
+			}
+
+			// Failsafe: create the translated variation post directly under $tr_parent_id
+			if (!$translated_var_id && $tr_parent_id) {
+				$orig_var = wc_get_product($product_id);
+				if ($orig_var) {
+					$new_tr_var = new WC_Product_Variation();
+					$new_tr_var->set_parent_id($tr_parent_id);
+					$new_tr_var->set_sku($orig_var->get_sku() . '-EN');
+					$new_tr_var->set_status('publish');
+					$new_tr_var->set_regular_price($orig_var->get_regular_price());
+					$new_tr_var->set_price($orig_var->get_price());
+					$new_tr_var->set_manage_stock($orig_var->get_manage_stock());
+					$new_tr_var->set_stock_quantity($orig_var->get_stock_quantity());
+					$new_tr_var->set_weight($orig_var->get_weight());
+					$new_tr_var->set_attributes($orig_var->get_attributes());
+					$saved_id = $new_tr_var->save();
+					if ($saved_id) {
+						update_post_meta($saved_id, '_wcml_duplicate_of_variation', $product_id);
+						global $sitepress;
+						if (isset($sitepress)) {
+							$trid = $sitepress->get_element_trid($product_id, 'post_product_variation');
+							if (!$trid) {
+								$sitepress->set_element_language_details($product_id, 'post_product_variation', null, 'fr');
+								$trid = $sitepress->get_element_trid($product_id, 'post_product_variation');
+							}
+							$sitepress->set_element_language_details($saved_id, 'post_product_variation', $trid, 'en', 'fr');
+						}
+					}
+				}
 			}
 		} else {
-			if (empty($title_en)) wp_send_json_error('English title is required.');
+			if (empty($title_en)) {
+				MJF_GSheet_Logger::error(sprintf(__('Translation for SKU %s failed: English title missing in Google Sheet.', 'mjf-gsheet-importer'), $sku), 'create_translation');
+				wp_send_json_error('English title is required.');
+			}
 			$formatted_item = $this->format_raw_for_upsert($raw);
 			$this->upsert_translation($product_id, $formatted_item, 'en');
 		}
@@ -2447,6 +2715,12 @@ class MJF_GSheet_Product_Importer
 				'diff' => $new_diff
 			])
 		], ['id' => $id]);
+
+		MJF_GSheet_Logger::success(
+			sprintf(__('English translation created / synced successfully for SKU %s (FR ID: %d).', 'mjf-gsheet-importer'), $sku, $product_id),
+			'create_translation',
+			['sku' => $sku, 'product_id' => $product_id]
+		);
 
 		wp_send_json_success('English translation created successfully.');
 	}
@@ -2486,6 +2760,7 @@ class MJF_GSheet_Product_Importer
 		$items = $wpdb->get_results("SELECT * FROM {$table_name} WHERE status = 'pending' LIMIT 10");
 
 		if (empty($items)) {
+			MJF_GSheet_Logger::success(__('Batch synchronization completed: all items processed.', 'mjf-gsheet-importer'), 'sync_batch');
 			wp_send_json_success(['message' => 'Sync complete!', 'continue' => false]);
 		}
 
@@ -2508,6 +2783,12 @@ class MJF_GSheet_Product_Importer
 					$this->sync_field_to_wp($item->product_id, $field, $vals['gs'], $raw_item);
 				} else if ($dir === 'wp_to_gs') {
 					$gs_col = $mapping[$field] ?? '';
+					if ($field === 'description' && ($diff_data['type'] ?? '') === 'variation') {
+						$short_col = $mapping['short_description'] ?? 'Description FR';
+						if (isset($raw_item[$short_col]) && (!empty($raw_item[$short_col]) || empty($raw_item[$mapping['description'] ?? 'Contenu additionel FR'] ?? ''))) {
+							$gs_col = $short_col;
+						}
+					}
 					if ($gs_col) {
 						$this->api->write_to_google_sheet($item->gs_row_index, $gs_col, $vals['wp']);
 					}
@@ -2516,6 +2797,12 @@ class MJF_GSheet_Product_Importer
 			$wpdb->update($table_name, ['status' => 'processed'], ['id' => $item->id]);
 			$processed++;
 		}
+
+		MJF_GSheet_Logger::info(
+			sprintf(__('Sync batch processed: %d items updated.', 'mjf-gsheet-importer'), $processed),
+			'sync_batch',
+			['processed' => $processed]
+		);
 
 		wp_send_json_success([
 			'message' => "Processed $processed items.",
@@ -2567,10 +2854,16 @@ class MJF_GSheet_Product_Importer
 				$product->set_weight($value);
 				break;
 			case 'description':
-				$product->set_description($value);
-				break;
 			case 'short_description':
-				$product->set_short_description($value);
+				if ($product->is_type('variation')) {
+					$product->set_description($value);
+				} else {
+					if ($field === 'description') {
+						$product->set_description($value);
+					} else {
+						$product->set_short_description($value);
+					}
+				}
 				break;
 			case 'image_main':
 				$mapping = $this->get_hardcoded_mapping();
@@ -3007,6 +3300,10 @@ class MJF_GSheet_Product_Importer
 
 		require_once(ABSPATH . 'wp-admin/includes/upgrade.php');
 		dbDelta($sql);
+
+		if (class_exists('MJF_GSheet_Logger')) {
+			MJF_GSheet_Logger::create_table();
+		}
 	}
 
 	private function find_attachment_by_base_name($base_name)
@@ -3040,7 +3337,7 @@ class MJF_GSheet_Product_Importer
 		}
 
 		$this->log(sprintf('Attempting to set shipping class "%s" for product %s', $shipping_class_name, $sku));
-		
+
 		$term_id = 0;
 		$classes = WC()->shipping()->get_shipping_classes();
 		foreach ($classes as $sc) {
@@ -3139,6 +3436,11 @@ class MJF_GSheet_Product_Importer
 		$mapping = $this->get_hardcoded_mapping();
 		$stock_col = $mapping['stock'] ?? 'Stock';
 
+		MJF_GSheet_Logger::info(
+			sprintf(__('Order #%d completed: checking WooCommerce stock to update in Google Sheets...', 'mjf-gsheet-importer'), $order_id),
+			'order_stock'
+		);
+
 		foreach ($order->get_items() as $item) {
 			$product = $item->get_product();
 			if (!$product) continue;
@@ -3172,11 +3474,194 @@ class MJF_GSheet_Product_Importer
 
 			if ($row && !empty($row->gs_row_index)) {
 				if ($stock_col) {
-					$this->api->write_to_google_sheet($row->gs_row_index, $stock_col, $stock_qty);
-					$this->log(sprintf('Stock updated in GSheet for order %d: Product %d -> %d', $order_id, $original_id, $stock_qty));
+					$result = $this->api->write_to_google_sheet($row->gs_row_index, $stock_col, $stock_qty);
+					if (is_wp_error($result)) {
+						MJF_GSheet_Logger::error(
+							sprintf(__('Order #%d: Failed to update stock in Google Sheets for SKU %s: %s', 'mjf-gsheet-importer'), $order_id, $sku, $result->get_error_message()),
+							'order_stock'
+						);
+					} else {
+						MJF_GSheet_Logger::success(
+							sprintf(__('Order #%d: Stock updated in Google Sheets for SKU %s (ID: %d) -> Quantity: %d (row %d).', 'mjf-gsheet-importer'), $order_id, $sku, $original_id, $stock_qty, $row->gs_row_index),
+							'order_stock',
+							['order_id' => $order_id, 'sku' => $sku, 'product_id' => $original_id, 'stock' => $stock_qty, 'row_index' => $row->gs_row_index]
+						);
+					}
 				}
+			} else {
+				MJF_GSheet_Logger::warning(
+					sprintf(__('Order #%d: Product SKU %s not found in Google Sheets sync table (no matching row).', 'mjf-gsheet-importer'), $order_id, $sku),
+					'order_stock'
+				);
 			}
 		}
+	}
+
+	/**
+	 * Log settings update
+	 */
+	public function log_settings_update($old_value, $value)
+	{
+		$sheet_id = $value['sheet_id'] ?? '';
+		$sheet_name = $value['sheet_name'] ?? '';
+		$header_row = $value['header_row'] ?? 1;
+
+		$user = wp_get_current_user();
+		$username = $user && $user->ID ? $user->user_login : 'admin';
+
+		MJF_GSheet_Logger::info(
+			sprintf(__('Plugin settings updated by %s (Sheet ID: %s, Sheet Tab: %s, Header Row: %s).', 'mjf-gsheet-importer'), $username, $sheet_id, $sheet_name, $header_row),
+			'settings',
+			['new' => $value]
+		);
+	}
+
+	/**
+	 * AJAX endpoint to retrieve logs HTML
+	 */
+	public function ajax_get_logs()
+	{
+		if (! current_user_can('manage_woocommerce')) {
+			wp_send_json_error('Permission denied');
+		}
+
+		$page     = isset($_POST['page']) ? intval($_POST['page']) : 1;
+		$per_page = 100;
+
+		$logs_data = MJF_GSheet_Logger::get_logs([
+			'page'     => $page,
+			'per_page' => $per_page,
+		]);
+
+		ob_start();
+		$items = $logs_data['items'];
+		if (empty($items)) {
+			?>
+			<div class="mjf-log-empty-state">
+				<p style="font-size: 14px; font-weight: 500; margin: 0; color: #50575e;"><?php _e('No logs recorded yet.', 'mjf-gsheet-importer'); ?></p>
+				<p style="font-size: 12px; margin: 5px 0 0; color: #8c8f94;"><?php _e('Import, export and error events will appear here automatically.', 'mjf-gsheet-importer'); ?></p>
+			</div>
+			<?php
+		} else {
+			?>
+			<table class="widefat striped mjf-log-table">
+				<thead>
+					<tr>
+						<th style="width: 160px;"><?php _e('Date / Time', 'mjf-gsheet-importer'); ?></th>
+						<th style="width: 105px;"><?php _e('Level', 'mjf-gsheet-importer'); ?></th>
+						<th><?php _e('Message', 'mjf-gsheet-importer'); ?></th>
+					</tr>
+				</thead>
+				<tbody>
+					<?php foreach ($items as $item) : ?>
+						<tr class="mjf-log-row mjf-log-level-<?php echo esc_attr($item['level']); ?>">
+							<td style="font-family: monospace; font-size: 11px; white-space: nowrap; color: #555;">
+								<?php echo esc_html($item['created_at']); ?>
+							</td>
+							<td>
+								<?php echo MJF_GSheet_Logger::get_level_badge($item['level']); ?>
+							</td>
+							<td style="word-break: break-word; line-height: 1.45; font-size: 12px;">
+								<?php echo esc_html($item['message']); ?>
+							</td>
+						</tr>
+					<?php endforeach; ?>
+				</tbody>
+			</table>
+
+			<!-- Pagination Controls -->
+			<?php if ($logs_data['total_pages'] > 1) : ?>
+				<div class="mjf-log-pagination-wrapper">
+					<div style="color: #646970; font-size: 12px;">
+						<?php printf(__('Page %1$d of %2$d (%3$d logs)', 'mjf-gsheet-importer'), $page, $logs_data['total_pages'], $logs_data['total']); ?>
+					</div>
+					<div style="display: flex; gap: 4px; align-items: center;">
+						<?php if ($page > 1) : ?>
+							<button type="button" class="button button-small mjf-log-page-btn" data-page="1" title="<?php esc_attr_e('First page', 'mjf-gsheet-importer'); ?>">«</button>
+							<button type="button" class="button button-small mjf-log-page-btn" data-page="<?php echo $page - 1; ?>"><?php _e('‹ Previous', 'mjf-gsheet-importer'); ?></button>
+						<?php endif; ?>
+
+						<span style="font-size: 12px; margin: 0 6px; color: #2c3338; font-weight: 500;">
+							<?php echo $page; ?> / <?php echo $logs_data['total_pages']; ?>
+						</span>
+
+						<?php if ($page < $logs_data['total_pages']) : ?>
+							<button type="button" class="button button-small mjf-log-page-btn" data-page="<?php echo $page + 1; ?>"><?php _e('Next ›', 'mjf-gsheet-importer'); ?></button>
+							<button type="button" class="button button-small mjf-log-page-btn" data-page="<?php echo $logs_data['total_pages']; ?>" title="<?php esc_attr_e('Last page', 'mjf-gsheet-importer'); ?>">»</button>
+						<?php endif; ?>
+					</div>
+				</div>
+			<?php endif; ?>
+			<?php
+		}
+
+		$html = ob_get_clean();
+
+		wp_send_json_success([
+			'html'         => $html,
+			'total'        => $logs_data['total'],
+			'total_pages'  => $logs_data['total_pages'],
+			'current_page' => $logs_data['current_page'],
+		]);
+	}
+
+	/**
+	 * AJAX endpoint to clear all logs
+	 */
+	public function ajax_clear_logs()
+	{
+		if (! current_user_can('manage_woocommerce')) {
+			wp_send_json_error('Permission denied');
+		}
+
+		MJF_GSheet_Logger::clear_logs();
+		wp_send_json_success(['message' => __('Logs cleared successfully.', 'mjf-gsheet-importer')]);
+	}
+
+	/**
+	 * Export logs as CSV file
+	 */
+	public function ajax_export_logs()
+	{
+		if (! current_user_can('manage_woocommerce')) {
+			wp_die('Permission denied');
+		}
+
+		check_admin_referer('mjf_gsheet_export_logs');
+
+		global $wpdb;
+		$table_name = MJF_GSheet_Logger::get_table_name();
+		$logs = $wpdb->get_results("SELECT * FROM {$table_name} ORDER BY id DESC LIMIT 5000", ARRAY_A);
+
+		$filename = 'mjf-gsheet-logs-' . gmdate('Y-m-d-His') . '.csv';
+
+		header('Content-Type: text/csv; charset=utf-8');
+		header('Content-Disposition: attachment; filename=' . $filename);
+		header('Pragma: no-cache');
+		header('Expires: 0');
+
+		$output = fopen('php://output', 'w');
+		// Output UTF-8 BOM for Excel compatibility
+		fputs($output, "\xEF\xBB\xBF");
+
+		// Header row
+		fputcsv($output, ['ID', 'Date / Heure', 'Niveau', 'Action', 'Message', 'Contexte (JSON)'], ';');
+
+		if (!empty($logs)) {
+			foreach ($logs as $log) {
+				fputcsv($output, [
+					$log['id'],
+					$log['created_at'],
+					strtoupper($log['level']),
+					MJF_GSheet_Logger::get_action_label($log['action']),
+					$log['message'],
+					$log['context'] ?? '',
+				], ';');
+			}
+		}
+
+		fclose($output);
+		exit;
 	}
 }
 

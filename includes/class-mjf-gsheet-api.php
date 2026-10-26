@@ -8,8 +8,12 @@ class MJF_GSheet_API
 {
 	private $option_name = 'mjf_gsheet_importer_settings';
 
-	public function log($message)
+	public function log($message, $level = 'info', $action = 'api', $context = [])
 	{
+		if (class_exists('MJF_GSheet_Logger')) {
+			MJF_GSheet_Logger::log($level, $message, $action, $context);
+		}
+
 		$logs = get_option('mjf_gsheet_import_logs', []);
 		$logs[] = [
 			'time'    => current_time('Y-m-d H:i:s'),
@@ -51,7 +55,12 @@ class MJF_GSheet_API
 		$sheet_name = $settings['sheet_name'] ?? 'Sheet1';
 		$service_account_json = $settings['google_service_account'] ?? '';
 
-		if (empty($sheet_id)) return new WP_Error('missing_id', 'Please provide a Google Sheet ID.');
+		if (empty($sheet_id)) {
+			$this->log(__('Please specify a Google Sheet ID in the settings.', 'mjf-gsheet-importer'), 'error', 'api');
+			return new WP_Error('missing_id', 'Please provide a Google Sheet ID.');
+		}
+
+		$this->log(sprintf(__('Fetching Google Sheet data (ID: %s, Sheet: %s)...', 'mjf-gsheet-importer'), $sheet_id, $sheet_name), 'info', 'api');
 
 		// Try API if credentials exist
 		if (!empty($service_account_json) && class_exists('Google\Client')) {
@@ -113,14 +122,16 @@ class MJF_GSheet_API
 				}
 
 				if (!empty($values)) {
+					$this->log(sprintf(__('Google Sheet data fetched successfully via Google API (%d rows).', 'mjf-gsheet-importer'), count($values)), 'success', 'api');
 					return $values;
 				}
 			} catch (\Exception $e) {
-				$this->log('Google API Error (Fetch Rich Text): ' . $e->getMessage());
+				$this->log('Google API Error (Fetch Rich Text): ' . $e->getMessage(), 'error', 'api', ['exception' => $e->getMessage()]);
 			}
 		}
 
 		// Fallback CSV method
+		$this->log(__('Attempting fetch via public Google Sheets CSV export...', 'mjf-gsheet-importer'), 'info', 'api');
 		$csv_url = sprintf(
 			'https://docs.google.com/spreadsheets/d/%s/export?format=csv&sheet=%s',
 			urlencode($sheet_id),
@@ -128,11 +139,16 @@ class MJF_GSheet_API
 		);
 
 		$response = wp_remote_get($csv_url, ['timeout' => 30]);
-		if (is_wp_error($response)) return $response;
+		if (is_wp_error($response)) {
+			$this->log('HTTP CSV Request Error: ' . $response->get_error_message(), 'error', 'api');
+			return $response;
+		}
 
 		$body = trim(wp_remote_retrieve_body($response));
 		if (strpos($body, '<!DOCTYPE html') !== false || strpos($body, '<html') !== false) {
-			return new WP_Error('html_returned', 'Error: Google Sheets returned an HTML page. Ensure it is publicly viewable or provide API credentials.');
+			$err_msg = 'Error: Google Sheets returned an HTML page. Ensure it is publicly viewable or provide API credentials.';
+			$this->log(__('Error: Google Sheets returned an HTML page instead of CSV. Ensure the sheet is public or configure the service account.', 'mjf-gsheet-importer'), 'error', 'api');
+			return new WP_Error('html_returned', $err_msg);
 		}
 
 		$temp_file = fopen('php://temp', 'r+');
@@ -143,6 +159,7 @@ class MJF_GSheet_API
 			$data[] = $row;
 		}
 		fclose($temp_file);
+		$this->log(sprintf(__('Google Sheet data fetched successfully via CSV export (%d rows).', 'mjf-gsheet-importer'), count($data)), 'success', 'api');
 		return $data;
 	}
 
@@ -205,7 +222,12 @@ class MJF_GSheet_API
 	public function write_to_google_sheet($row_index, $column_name, $value)
 	{
 		if ($this->is_local_environment()) {
-			$this->log(sprintf('Blocked write to Google Sheets on local environment: row %d, column "%s", value "%s"', $row_index, $column_name, $value));
+			$this->log(
+				sprintf(__('Write skipped in local environment: row %d, column "%s", value "%s"', 'mjf-gsheet-importer'), $row_index, $column_name, (string)$value),
+				'warning',
+				'export_wp_gs',
+				['row' => $row_index, 'column' => $column_name, 'value' => $value]
+			);
 			return true;
 		}
 
@@ -215,6 +237,7 @@ class MJF_GSheet_API
 		$service_account_json = $settings['google_service_account'] ?? '';
 
 		if (empty($service_account_json) || !class_exists('Google\Client')) {
+			$this->log(__('Cannot write to Google Sheet: Google API Client or service account JSON missing.', 'mjf-gsheet-importer'), 'error', 'export_wp_gs');
 			return new WP_Error('missing_api', 'Google API Client or credentials missing.');
 		}
 
@@ -238,7 +261,11 @@ class MJF_GSheet_API
 					break;
 				}
 			}
-			if ($col_index === false) return new WP_Error('col_not_found', "Column '$column_name' not found. Available: " . implode(', ', $headers));
+			if ($col_index === false) {
+				$err_msg = "Column '$column_name' not found. Available: " . implode(', ', $headers);
+				$this->log(sprintf(__('Cannot write to Google Sheet: column "%s" not found.', 'mjf-gsheet-importer'), $column_name), 'error', 'export_wp_gs');
+				return new WP_Error('col_not_found', $err_msg);
+			}
 
 			// Simple index to letter converter (handles A to ZZ)
 			$col_letter = '';
@@ -257,7 +284,10 @@ class MJF_GSheet_API
 				}
 			}
 
-			if ($target_sheet_id === null) return new WP_Error('sheet_not_found', "Sheet '$sheet_name' not found.");
+			if ($target_sheet_id === null) {
+				$this->log(sprintf(__('Cannot write to Google Sheet: sheet tab "%s" not found.', 'mjf-gsheet-importer'), $sheet_name), 'error', 'export_wp_gs');
+				return new WP_Error('sheet_not_found', "Sheet '$sheet_name' not found.");
+			}
 
 			// Check if we should push as Rich Text
 			$html_cols = ['Description FR', 'Description EN', 'Contenu additionel FR', 'Contenu additionel EN'];
@@ -305,9 +335,16 @@ class MJF_GSheet_API
 				$service->spreadsheets_values->update($sheet_id, $cell_range, $body, $params);
 			}
 
+			$this->log(
+				sprintf(__('Google Sheets export successful: row %d, column "%s", value: "%s"', 'mjf-gsheet-importer'), $row_index, $column_name, mb_strimwidth((string)$value, 0, 80, '...')),
+				'success',
+				'export_wp_gs',
+				['row' => $row_index, 'column' => $column_name, 'value' => $value]
+			);
+
 			return true;
 		} catch (\Exception $e) {
-			$this->log('Google API Error (Write): ' . $e->getMessage());
+			$this->log('Google API Error (Write): ' . $e->getMessage(), 'error', 'export_wp_gs', ['row' => $row_index, 'column' => $column_name, 'error' => $e->getMessage()]);
 			return new WP_Error('api_error', $e->getMessage());
 		}
 	}

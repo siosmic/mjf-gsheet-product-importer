@@ -1,5 +1,46 @@
-vendor/
-composer.lock
+# Dependencies
+/vendor/
+composer.phar
+
+# Environment & Credentials (Google Service Account keys, API secrets)
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*service*account*.json
+*credentials*.json
+client_secret*.json
+
+# Logs & Temporary files
+*.log
+debug.log
+error_log
+*.tmp
+*.temp
+
+# Backups & Archives
+*.bak
+*.backup
+*.old
+*~
+*.zip
+*.tar.gz
+
+# Operating System files
 .DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+[Dd]esktop.ini
+
+# IDEs & Code Editors
 .idea/
 .vscode/
+*.sublime-project
+*.sublime-workspace
+*.swp
+*.swo

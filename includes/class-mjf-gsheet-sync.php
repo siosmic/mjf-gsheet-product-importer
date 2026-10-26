@@ -188,8 +188,16 @@ class MJF_GSheet_Sync
 
 		$variation = $variation_id ? new WC_Product_Variation($variation_id) : new WC_Product_Variation();
 
-		// Description and Short Description (NOT INHERITED OR SAVED ON VARIATION)
-		// User specifically requested not to save descriptions on variations.
+		// Variation Description (saved on variation if provided)
+		$var_desc = '';
+		if (!empty($item['short_description'])) {
+			$var_desc = $item['short_description'];
+		} elseif (!empty($item['description'])) {
+			$var_desc = $item['description'];
+		}
+		if (!empty($var_desc)) {
+			$variation->set_description($var_desc);
+		}
 
 		$variation->set_parent_id($parent_id);
 		$variation->set_sku($sku);
@@ -915,10 +923,16 @@ class MJF_GSheet_Sync
 				$product->set_weight($value);
 				break;
 			case 'description':
-				$product->set_description($value);
-				break;
 			case 'short_description':
-				$product->set_short_description($value);
+				if ($product->is_type('variation')) {
+					$product->set_description($value);
+				} else {
+					if ($field === 'description') {
+						$product->set_description($value);
+					} else {
+						$product->set_short_description($value);
+					}
+				}
 				break;
 			case 'image_main':
 				$mapping = $this->main->get_hardcoded_mapping();

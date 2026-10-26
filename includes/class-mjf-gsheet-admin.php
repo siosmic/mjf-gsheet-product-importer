@@ -124,6 +124,137 @@ class MJF_GSheet_Admin
 			.variation-list-table th {
 				background: #f9f9f9;
 			}
+
+			/* Classic Log UI */
+			.mjf-log-table {
+				border-collapse: collapse;
+				width: 100%;
+				background: #fff;
+				border: 1px solid #dcdcde;
+			}
+
+			.mjf-log-table th {
+				background: #f6f7f7;
+				padding: 9px 12px;
+				font-size: 12px;
+				font-weight: 600;
+				border-bottom: 1px solid #dcdcde;
+				text-align: left;
+			}
+
+			.mjf-log-table td {
+				padding: 8px 12px;
+				vertical-align: middle;
+				border-bottom: 1px solid #f0f0f1;
+			}
+
+			.mjf-log-row:hover td {
+				background-color: #f6f7f7 !important;
+			}
+
+			/* Warning: Orange color-code */
+			.mjf-log-row.mjf-log-level-warning td {
+				background-color: #fffbf0;
+			}
+			.mjf-log-row.mjf-log-level-warning td:first-child {
+				border-left: 4px solid #f59e0b;
+			}
+
+			/* Error: Red color-code */
+			.mjf-log-row.mjf-log-level-error td {
+				background-color: #fef2f2;
+			}
+			.mjf-log-row.mjf-log-level-error td:first-child {
+				border-left: 4px solid #ef4444;
+			}
+
+			.mjf-log-badge {
+				display: inline-block;
+				padding: 2px 7px;
+				border-radius: 3px;
+				font-size: 10px;
+				font-weight: 700;
+				font-family: monospace;
+				letter-spacing: 0.5px;
+				line-height: 1.3;
+				white-space: nowrap;
+			}
+
+			/* Orange = Warning */
+			.mjf-log-warning {
+				background: #fef3c7;
+				color: #b45309;
+				border: 1px solid #fcd34d;
+			}
+
+			/* Rouge = Error */
+			.mjf-log-error {
+				background: #fee2e2;
+				color: #b91c1c;
+				border: 1px solid #fca5a5;
+			}
+
+			.mjf-log-success {
+				background: #dcfce7;
+				color: #15803d;
+				border: 1px solid #86efac;
+			}
+
+			.mjf-log-info {
+				background: #f1f5f9;
+				color: #475569;
+				border: 1px solid #cbd5e1;
+			}
+
+			.mjf-log-empty-state {
+				padding: 40px 20px;
+				text-align: center;
+				background: #fafafa;
+				border: 1px dashed #c3c4c7;
+				border-radius: 4px;
+			}
+
+			.mjf-log-pagination-wrapper {
+				display: flex;
+				justify-content: space-between;
+				align-items: center;
+				margin-top: 15px;
+				padding-top: 12px;
+				border-top: 1px solid #dcdcde;
+				flex-wrap: wrap;
+				gap: 10px;
+			}
+
+			/* Perfect Dashicon Alignment in all Buttons */
+			.mjf-step-card .button,
+			.mjf-step-card a.button,
+			.mjf-log-toolbar .button,
+			#tab-logs .button,
+			#tab-logs a.button,
+			.mjf-btn-with-icon {
+				display: inline-flex !important;
+				align-items: center !important;
+				justify-content: center !important;
+				vertical-align: middle !important;
+				gap: 6px !important;
+				line-height: normal !important;
+			}
+
+			.mjf-step-card .button .dashicons,
+			.mjf-step-card a.button .dashicons,
+			#tab-logs .button .dashicons,
+			#tab-logs a.button .dashicons,
+			.mjf-btn-with-icon .dashicons {
+				font-size: 16px !important;
+				width: 16px !important;
+				height: 16px !important;
+				line-height: 16px !important;
+				vertical-align: middle !important;
+				margin: 0 !important;
+				padding: 0 !important;
+				display: inline-block !important;
+				flex-shrink: 0 !important;
+			}
 		</style>
 
 		<div class="wrap">
@@ -132,6 +263,7 @@ class MJF_GSheet_Admin
 			<h2 class="nav-tab-wrapper mjf-tabs">
 				<a href="#sync" class="nav-tab <?php echo $current_tab == 'sync' ? 'nav-tab-active' : ''; ?>" data-tab="sync">1. <?php _e('Sync Dashboard', 'mjf-gsheet-importer'); ?></a>
 				<a href="#settings" class="nav-tab <?php echo $current_tab == 'settings' ? 'nav-tab-active' : ''; ?>" data-tab="settings">2. <?php _e('Settings', 'mjf-gsheet-importer'); ?></a>
+				<a href="#logs" class="nav-tab <?php echo $current_tab == 'logs' ? 'nav-tab-active' : ''; ?>" data-tab="logs">3. <?php _e('Logs', 'mjf-gsheet-importer'); ?></a>
 			</h2>
 
 			<div class="mjf-step-card">
@@ -191,6 +323,32 @@ class MJF_GSheet_Admin
 						<?php submit_button(__('Save Settings', 'mjf-gsheet-importer')); ?>
 					</form>
 				</div>
+
+				<!-- TAB: LOGS -->
+				<div id="tab-logs" class="mjf-tab-content <?php echo $current_tab == 'logs' ? 'active' : ''; ?>">
+					<div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; margin-bottom: 15px; gap: 15px;">
+						<div>
+							<h2 style="margin: 0;"><?php _e('Activity Logs', 'mjf-gsheet-importer'); ?></h2>
+							<p style="margin: 4px 0 0; color: #646970; font-size: 13px;"><?php _e('History of synchronizations, product creations, and errors.', 'mjf-gsheet-importer'); ?></p>
+						</div>
+						<div style="display:flex; gap:10px; align-items:center;">
+							<button id="mjf-refresh-logs-btn" class="button button-secondary mjf-btn-with-icon" type="button" title="<?php esc_attr_e('Refresh logs', 'mjf-gsheet-importer'); ?>">
+								<span class="dashicons dashicons-update"></span>
+								<span><?php _e('Refresh', 'mjf-gsheet-importer'); ?></span>
+							</button>
+							<button id="mjf-clear-logs-btn" class="button mjf-btn-with-icon" type="button" style="color:#b32d2e; border-color:#d63638; background:#fff;">
+								<span class="dashicons dashicons-trash"></span>
+								<span><?php _e('Clear Logs', 'mjf-gsheet-importer'); ?></span>
+							</button>
+							<span class="spinner" id="mjf-logs-spinner" style="float:none; margin:0;"></span>
+						</div>
+					</div>
+
+					<!-- Logs Container (AJAX Table) -->
+					<div id="mjf-logs-container">
+						<p style="color: #646970; font-style: italic;"><?php _e('Loading logs...', 'mjf-gsheet-importer'); ?></p>
+					</div>
+				</div>
 			</div>
 
 			<script>
@@ -209,6 +367,8 @@ class MJF_GSheet_Admin
 
 						if (target === 'sync') {
 							loadComparisonPage(1);
+						} else if (target === 'logs') {
+							loadLogsPage(1);
 						}
 
 						history.pushState(null, null, '#' + target);
@@ -229,9 +389,11 @@ class MJF_GSheet_Admin
 						});
 					}
 
-					// Initial load if on sync tab
+					// Initial load if on sync or logs tab
 					if ($('#tab-sync').hasClass('active')) {
 						loadComparisonPage(1);
+					} else if ($('#tab-logs').hasClass('active')) {
+						loadLogsPage(1);
 					}
 
 					// Generate Comparison
@@ -420,6 +582,71 @@ class MJF_GSheet_Admin
 						}
 
 						processBatch();
+					});
+
+					// --- LOGS TAB LOGIC ---
+					// Logs Handling
+					var currentLogsPage = 1;
+
+					function loadLogsPage(page) {
+						page = page || 1;
+						currentLogsPage = page;
+						var $container = $('#mjf-logs-container');
+						var $spinner = $('#mjf-logs-spinner');
+
+						$spinner.addClass('is-active');
+
+						$.post(ajaxurl, {
+							action: 'mjf_gsheet_get_logs',
+							page: page
+						}, function(response) {
+							$spinner.removeClass('is-active');
+							if (response.success) {
+								$container.html(response.data.html);
+							} else {
+								$container.html('<p style="color:red; padding: 20px;">' + (response.data || 'Error loading logs.') + '</p>');
+							}
+						}).fail(function() {
+							$spinner.removeClass('is-active');
+							$container.html('<p style="color:red; padding: 20px;">A network error occurred while loading logs.</p>');
+						});
+					}
+
+					// Refresh logs
+					$('#mjf-refresh-logs-btn').on('click', function(e) {
+						e.preventDefault();
+						loadLogsPage(currentLogsPage);
+					});
+
+					// Clear all logs
+					$('#mjf-clear-logs-btn').on('click', function(e) {
+						e.preventDefault();
+						if (!confirm('Are you sure you want to clear all logs?')) {
+							return;
+						}
+
+						var $btn = $(this);
+						$btn.prop('disabled', true);
+
+						$.post(ajaxurl, {
+							action: 'mjf_gsheet_clear_logs'
+						}, function(response) {
+							$btn.prop('disabled', false);
+							if (response.success) {
+								loadLogsPage(1);
+							} else {
+								alert('Error: ' + (response.data || 'Failed to clear logs.'));
+							}
+						}).fail(function() {
+							$btn.prop('disabled', false);
+							alert('Communication error while clearing logs.');
+						});
+					});
+
+					// Log pagination buttons
+					$(document).on('click', '.mjf-log-page-btn', function(e) {
+						e.preventDefault();
+						loadLogsPage($(this).data('page'));
 					});
 
 					// Ensure UI opens correct tab on load
