@@ -383,22 +383,31 @@ class MJF_GSheet_Product_Importer
 
 					$attr_data[$attr_key] = $term_slug;
 
-					if (isset($parent_attributes[$attr_key])) {
-						$options = $parent_attributes[$attr_key]->get_options();
+					$found_key = null;
+					foreach ($parent_attributes as $pk => $p_attr) {
+						if (is_object($p_attr) && ($pk === $attr_key || $p_attr->get_name() === $attr_key || sanitize_title($p_attr->get_name()) === sanitize_title($attr_key))) {
+							$found_key = $pk;
+							break;
+						}
+					}
+
+					if ($found_key !== null) {
+						$options = $parent_attributes[$found_key]->get_options();
 						if (! in_array($term_id, $options)) {
 							$options[] = $term_id;
-							$parent_attributes[$attr_key]->set_options($options);
+							$parent_attributes[$found_key]->set_options(array_values(array_unique(array_filter(array_map('intval', $options)))));
 							$parent_updated = true;
 							$this->log(sprintf(__('Added term "%s" (slug: %s) to parent taxonomy "%s"', 'mjf-gsheet-importer'), $value, $term_slug, $attr_key));
 						}
+						$parent_attributes[$found_key]->set_variation(true);
 					} else {
 						$new_attr = new WC_Product_Attribute();
 						$new_attr->set_id(wc_attribute_taxonomy_id_by_name($attr_key));
 						$new_attr->set_name($attr_key);
 						$new_attr->set_options([$term_id]);
 						$new_attr->set_visible(true);
-						$new_attr->set_variation($attr_key === 'pa_tailles' || $attr_key === 'pa_taille');
-						$parent_attributes[$attr_key] = $new_attr;
+						$new_attr->set_variation(true);
+						$parent_attributes[sanitize_title($attr_key)] = $new_attr;
 						$parent_updated = true;
 						$this->log(sprintf(__('Initialized parent taxonomy "%s" with term "%s"', 'mjf-gsheet-importer'), $attr_key, $value));
 					}
@@ -406,21 +415,50 @@ class MJF_GSheet_Product_Importer
 					$attr_key = sanitize_title($display_name);
 					$attr_data[$attr_key] = $value;
 
-					if (isset($parent_attributes[$attr_key])) {
-						$options = $parent_attributes[$attr_key]->get_options();
+					$found_key = null;
+					foreach ($parent_attributes as $pk => $p_attr) {
+						if (is_object($p_attr) && ($pk === $attr_key || $p_attr->get_name() === $attr_key || sanitize_title($p_attr->get_name()) === sanitize_title($attr_key))) {
+							$found_key = $pk;
+							break;
+						}
+					}
+
+					if ($found_key !== null) {
+						$options = $parent_attributes[$found_key]->get_options();
 						if (! in_array($value, $options)) {
 							$options[] = $value;
-							$parent_attributes[$attr_key]->set_options($options);
+							$parent_attributes[$found_key]->set_options(array_values(array_unique($options)));
 							$parent_updated = true;
 							$this->log(sprintf(__('Added option "%s" to parent attribute "%s"', 'mjf-gsheet-importer'), $value, $display_name));
 						}
+					} else {
+						$new_attr = new WC_Product_Attribute();
+						$new_attr->set_id(0);
+						$new_attr->set_name($display_name);
+						$new_attr->set_options([$value]);
+						$new_attr->set_visible(true);
+						$new_attr->set_variation(false);
+						$parent_attributes[sanitize_title($attr_key)] = $new_attr;
+						$parent_updated = true;
 					}
 				}
 			}
 			$variation->set_attributes($attr_data);
 
 			if ($parent_updated) {
-				$parent_product->set_attributes($parent_attributes);
+				$clean_parent_attrs = [];
+				foreach ($parent_attributes as $p_attr) {
+					if (is_object($p_attr) && is_a($p_attr, 'WC_Product_Attribute')) {
+						$p_slug = sanitize_title($p_attr->get_name());
+						if (isset($clean_parent_attrs[$p_slug])) {
+							$merged_opts = array_values(array_unique(array_merge($clean_parent_attrs[$p_slug]->get_options(), $p_attr->get_options())));
+							$clean_parent_attrs[$p_slug]->set_options($merged_opts);
+						} else {
+							$clean_parent_attrs[$p_slug] = $p_attr;
+						}
+					}
+				}
+				$parent_product->set_attributes($clean_parent_attrs);
 				$parent_product->save();
 			}
 		}
@@ -665,7 +703,7 @@ class MJF_GSheet_Product_Importer
 						$term_ids[] = (int)$term->term_id;
 					}
 				}
-				$attribute->set_options($term_ids);
+				$attribute->set_options(array_values(array_unique(array_filter(array_map('intval', $term_ids)))));
 			} else {
 				$attribute->set_id(0);
 				$attribute->set_name($display_name);
@@ -675,7 +713,13 @@ class MJF_GSheet_Product_Importer
 			$attribute->set_position($position++);
 			$attribute->set_visible($visible);
 			$attribute->set_variation($variation);
-			$attributes[] = $attribute;
+			$attr_key = sanitize_title($display_name);
+			if (isset($attributes[$attr_key])) {
+				$merged_opts = array_values(array_unique(array_merge($attributes[$attr_key]->get_options(), $attribute->get_options())));
+				$attributes[$attr_key]->set_options($merged_opts);
+			} else {
+				$attributes[$attr_key] = $attribute;
+			}
 		}
 
 		$product->set_attributes($attributes);
@@ -743,8 +787,24 @@ class MJF_GSheet_Product_Importer
 			}
 
 			// Copy base fields that should be synced
-			// We append the language code to the SKU to avoid duplicates in WooCommerce
-			$translated_product->set_sku($sku . '-' . strtoupper($lang));
+			// Only set SKU if non-empty, and ensure parent variable SKU does not collide with variations
+			if (!empty($sku)) {
+				$parent_sku_to_set = $sku;
+				if ($original_product->is_type('variable')) {
+					$child_skus = [];
+					foreach ($original_product->get_children() as $child_id) {
+						$child_prod = wc_get_product($child_id);
+						if ($child_prod) $child_skus[] = $child_prod->get_sku();
+					}
+					if (in_array($sku, $child_skus, true)) {
+						$parent_sku_to_set = ''; // Parent cannot share SKU with child variation
+					}
+				}
+				if (!empty($parent_sku_to_set)) {
+					add_filter('wc_product_has_unique_sku', '__return_false', 9999);
+					$translated_product->set_sku($parent_sku_to_set);
+				}
+			}
 			$translated_product->set_name($item['title_en'] ?? $original_product->get_name());
 			$translated_product->set_description($item['description_en'] ?? $original_product->get_description());
 			$translated_product->set_short_description($item['content_en'] ?? $original_product->get_short_description());
@@ -769,14 +829,8 @@ class MJF_GSheet_Product_Importer
 				$translated_product->update_meta_data('_woocommerce_pos_uuid', wp_generate_uuid4());
 			}
 
-			// Force attributes for variable translation
-			if ($original_product->is_type('variable')) {
-				$attrs = $original_product->get_attributes();
-				$translated_product->set_attributes($attrs);
-				$translated_id = $translated_product->save();
-			} else {
-				$translated_id = $translated_product->save();
-			}
+			$translated_id = $translated_product->save();
+			remove_filter('wc_product_has_unique_sku', '__return_false', 9999);
 
 			// Link to original via WPML
 			$trid = apply_filters('wpml_element_trid', null, $original_id, 'post_product');
@@ -792,6 +846,13 @@ class MJF_GSheet_Product_Importer
 
 			// Force attributes for variable and simple translation with translated term IDs
 			$this->sync_attributes_to_translation($original_product, $translated_product, $lang);
+
+			// Synchronize variations for variable products
+			if ($original_product->is_type('variable')) {
+				$this->sync_variable_product_variations($original_product, $translated_product, $lang);
+			}
+
+			return $translated_id;
 		} else {
 			$this->log(sprintf(__('Updating existing %s translation for product %s (ID: %d)', 'mjf-gsheet-importer'), strtoupper($lang), $sku, $translated_id));
 			$translated_product = wc_get_product($translated_id);
@@ -803,6 +864,26 @@ class MJF_GSheet_Product_Importer
 			$translated_product->set_regular_price($original_product->get_regular_price());
 			$translated_product->set_manage_stock($original_product->get_manage_stock());
 			$translated_product->set_stock_quantity($original_product->get_stock_quantity());
+
+			// Sync parent SKU with FR (strip old -EN or -LANG suffixes)
+			$current_tr_sku = $translated_product->get_sku();
+			if (!empty($sku)) {
+				$parent_sku_to_set = $sku;
+				if ($original_product->is_type('variable')) {
+					$child_skus = [];
+					foreach ($original_product->get_children() as $child_id) {
+						$child_prod = wc_get_product($child_id);
+						if ($child_prod) $child_skus[] = $child_prod->get_sku();
+					}
+					if (in_array($sku, $child_skus, true)) {
+						$parent_sku_to_set = '';
+					}
+				}
+				add_filter('wc_product_has_unique_sku', '__return_false', 9999);
+				$translated_product->set_sku($parent_sku_to_set);
+			} elseif ($current_tr_sku === '-' . strtoupper($lang) || $current_tr_sku === '-EN' || (empty($sku) && !empty($current_tr_sku))) {
+				$translated_product->set_sku('');
+			}
 
 			$wp_shipping_class_id = $original_product->get_shipping_class_id();
 			if ($wp_shipping_class_id) {
@@ -821,6 +902,13 @@ class MJF_GSheet_Product_Importer
 			}
 
 			$translated_product->save();
+
+			// Synchronize variations for variable products
+			if ($original_product->is_type('variable')) {
+				$this->sync_variable_product_variations($original_product, $translated_product, $lang);
+			}
+
+			return $translated_id;
 		}
 	}
 
@@ -831,6 +919,7 @@ class MJF_GSheet_Product_Importer
 	{
 		$attrs = $original_product->get_attributes();
 		$translated_attrs = [];
+		$translated_id = $translated_product ? $translated_product->get_id() : 0;
 
 		foreach ($attrs as $key => $attr) {
 			// Handle cases where attribute is returned as a raw array instead of an object
@@ -852,7 +941,7 @@ class MJF_GSheet_Product_Importer
 
 				$attr_obj->set_position(isset($attr['position']) ? $attr['position'] : 0);
 				$attr_obj->set_visible(isset($attr['is_visible']) ? (bool) $attr['is_visible'] : true);
-				$attr_obj->set_variation(isset($attr['is_variation']) ? (bool) $attr['is_variation'] : true);
+				$attr_obj->set_variation(isset($attr['is_variation']) ? (bool) $attr['is_variation'] : false);
 
 				$attr = $attr_obj;
 			}
@@ -862,27 +951,350 @@ class MJF_GSheet_Product_Importer
 			}
 
 			$translated_attr = clone $attr;
+			$translated_attr->set_variation($attr->get_variation());
+			$translated_attr->set_visible($attr->get_visible());
 			if ($attr->is_taxonomy()) {
 				$taxonomy = $attr->get_name();
 				$options = $attr->get_options(); // Array of term IDs
 				$translated_options = [];
 				foreach ($options as $term_id) {
 					$translated_term_id = $this->translate_or_create_term($term_id, $taxonomy, $lang);
-					$translated_options[] = $translated_term_id;
+					$translated_options[] = (int) $translated_term_id;
+
+					// Clean up any orphan duplicate term created previously with '-{$lang}' in this taxonomy
+					$original_term = get_term($term_id, $taxonomy);
+					if ($original_term && !is_wp_error($original_term)) {
+						$dup_slug = $original_term->slug . '-' . $lang;
+						$orphan_term = get_term_by('slug', $dup_slug, $taxonomy);
+						if ($orphan_term && !is_wp_error($orphan_term) && (int)$orphan_term->term_id !== (int)$term_id) {
+							if ($translated_id) {
+								wp_remove_object_terms($translated_id, (int)$orphan_term->term_id, $taxonomy);
+							}
+							if (isset($orphan_term->count) && $orphan_term->count <= 0) {
+								wp_delete_term($orphan_term->term_id, $taxonomy);
+							}
+						}
+					}
 				}
-				$translated_attr->set_options($translated_options);
+				$clean_options = array_values(array_unique(array_filter(array_map('intval', $translated_options))));
+				$translated_attr->set_options($clean_options);
 			}
-			$translated_attrs[$key] = $translated_attr;
+
+			$attr_slug = sanitize_title($translated_attr->get_name());
+			if (isset($translated_attrs[$attr_slug])) {
+				$existing_opts = $translated_attrs[$attr_slug]->get_options();
+				$merged = array_values(array_unique(array_merge($existing_opts, $translated_attr->get_options())));
+				$translated_attrs[$attr_slug]->set_options($merged);
+			} else {
+				$translated_attrs[$attr_slug] = $translated_attr;
+			}
 		}
 
 		$translated_product->set_attributes($translated_attrs);
 		$translated_product->save();
 
-		// Set object terms on database level to ensure synchronization
-		$translated_id = $translated_product->get_id();
-		foreach ($translated_attrs as $attr) {
+		// Set object terms on database level to ensure synchronization (replaces terms, does not append duplicates)
+		if ($translated_id) {
+			foreach ($translated_attrs as $attr) {
+				if ($attr->is_taxonomy()) {
+					$clean_terms = array_values(array_unique(array_filter(array_map('intval', $attr->get_options()))));
+					wp_set_object_terms($translated_id, $clean_terms, $attr->get_name(), false);
+				}
+			}
+		}
+	}
+
+	/**
+	 * Synchronize variations from the original variable product to its translation
+	 */
+	public function sync_variable_product_variations($original_product, $translated_product, $lang = 'en')
+	{
+		if (!$original_product || !$translated_product) return;
+
+		$orig_id = is_numeric($original_product) ? (int)$original_product : $original_product->get_id();
+		$tr_id   = is_numeric($translated_product) ? (int)$translated_product : $translated_product->get_id();
+
+		if (!$orig_id || !$tr_id) return;
+
+		$orig_prod = is_numeric($original_product) ? wc_get_product($orig_id) : $original_product;
+		$tr_prod   = is_numeric($translated_product) ? wc_get_product($tr_id) : $translated_product;
+
+		if (!$orig_prod || !$orig_prod->is_type('variable') || !$tr_prod || !$tr_prod->is_type('variable')) {
+			return;
+		}
+
+		// Enable WCML context filter and allow identical SKUs between FR and translated variations
+		add_filter('wcml_product_synchronization_on_save_is_valid_context', '__return_true');
+		add_filter('wc_product_has_unique_sku', '__return_false', 9999);
+
+		// Get all children variation IDs of the original product
+		$child_variation_ids = $orig_prod->get_children();
+		global $wpdb;
+		if (empty($child_variation_ids)) {
+			$child_variation_ids = $wpdb->get_col($wpdb->prepare(
+				"SELECT ID FROM {$wpdb->posts} WHERE post_parent = %d AND post_type = 'product_variation' AND post_status != 'trash'",
+				$orig_id
+			));
+		}
+
+		if (empty($child_variation_ids)) {
+			remove_filter('wc_product_has_unique_sku', '__return_false', 9999);
+			return;
+		}
+
+		global $sitepress;
+		$default_lang = apply_filters('wpml_default_language', null) ?: 'fr';
+
+		// 1. Configure parent variable product attributes from original product preserving exact variation flags
+		$clean_parent_attrs = [];
+		$orig_parent_attrs = $orig_prod->get_attributes();
+		foreach ($orig_parent_attrs as $orig_attr) {
+			if (!is_object($orig_attr) || !is_a($orig_attr, 'WC_Product_Attribute')) {
+				continue;
+			}
+			$attr_slug = sanitize_title($orig_attr->get_name());
+			$tr_attr = clone $orig_attr;
+			// Preserve exact variation and visible flags from original FR attribute
+			$tr_attr->set_variation($orig_attr->get_variation());
+			$tr_attr->set_visible($orig_attr->get_visible());
+			if ($orig_attr->is_taxonomy()) {
+				$tax = $orig_attr->get_name();
+				$orig_opts = $orig_attr->get_options();
+				if (empty($orig_opts)) {
+					$orig_opts = wp_get_object_terms($orig_id, $tax, ['fields' => 'ids']);
+				}
+				$tr_opts = [];
+				foreach ((array)$orig_opts as $o_id) {
+					$tr_opts[] = (int) $this->translate_or_create_term($o_id, $tax, $lang);
+				}
+				$clean_opts = array_values(array_unique(array_filter($tr_opts)));
+				$tr_attr->set_options($clean_opts);
+				wp_set_object_terms($tr_id, $clean_opts, $tax, false);
+			}
+			$clean_parent_attrs[$attr_slug] = $tr_attr;
+		}
+		$tr_prod->set_attributes($clean_parent_attrs);
+		$tr_prod->save();
+		foreach ($clean_parent_attrs as $attr) {
 			if ($attr->is_taxonomy()) {
-				wp_set_object_terms($translated_id, $attr->get_options(), $attr->get_name());
+				wp_set_object_terms($tr_id, $attr->get_options(), $attr->get_name(), false);
+			}
+		}
+		clean_post_cache($tr_id);
+		wp_cache_delete($tr_id, 'post_meta');
+
+		// 2. Ensure FR parent product is authoritatively synced in WooCommerce
+		if ($orig_prod) {
+			$orig_prod->save();
+			WC_Product_Variable::sync($orig_id);
+		}
+
+		// 3. Clear any cached sync hash from existing translated variations of $tr_id so WCML doesn't skip
+		$wpdb->query($wpdb->prepare(
+			"DELETE pm FROM {$wpdb->postmeta} pm
+			 JOIN {$wpdb->posts} p ON pm.post_id = p.ID
+			 WHERE p.post_parent = %d AND pm.meta_key = 'wcml_sync_hash'",
+			$tr_id
+		));
+
+		// 4. Reload WPML post translations in-memory cache to ensure it sees $tr_id
+		global $wpml_post_translations, $sitepress;
+		if ($wpml_post_translations && method_exists($wpml_post_translations, 'reload')) {
+			$wpml_post_translations->reload();
+		}
+
+		add_filter('wcml_product_synchronization_on_save_is_valid_context', '__return_true', 9999);
+		add_filter('wc_product_has_unique_sku', '__return_false', 9999);
+
+		$orig_post = get_post($orig_id);
+
+		// Trigger WCML components directly via native WCML actions
+		do_action('wpml_sync_all_custom_fields', $orig_id);
+		do_action('wcml_synchronize_product_component', $orig_post, [$tr_id], [$tr_id => $lang], 'attributes');
+		do_action('wcml_synchronize_product_component', $orig_post, [$tr_id], [$tr_id => $lang], 'variations');
+		do_action('wcml_synchronize_product_translations', $orig_post, [$tr_id], [$tr_id => $lang]);
+		do_action('woocommerce_ajax_save_product_variations', $orig_id);
+
+		// 5. Post-process translated variations: ensure exact SKUs, status, descriptions, and attribute values
+		foreach ($child_variation_ids as $orig_child_id) {
+			$orig_child_id = (int) $orig_child_id;
+			$orig_var = wc_get_product($orig_child_id);
+			if (!$orig_var || !$orig_var->is_type('variation')) {
+				continue;
+			}
+
+			// Locate translated variation
+			$tr_var_id = apply_filters('wpml_object_id', $orig_child_id, 'product_variation', false, $lang);
+			if (!$tr_var_id || $tr_var_id == $orig_child_id) {
+				$tr_var_id = apply_filters('wpml_object_id', $orig_child_id, 'post_product_variation', false, $lang);
+			}
+			if (!$tr_var_id || $tr_var_id == $orig_child_id) {
+				$tr_var_id = $wpdb->get_var($wpdb->prepare(
+					"SELECT t.element_id FROM {$wpdb->prefix}icl_translations s
+					 JOIN {$wpdb->prefix}icl_translations t ON s.trid = t.trid AND t.language_code = %s
+					 WHERE s.element_id = %d AND s.element_type = 'post_product_variation' LIMIT 1",
+					$lang, $orig_child_id
+				));
+			}
+			if (!$tr_var_id) {
+				$tr_var_id = $wpdb->get_var($wpdb->prepare(
+					"SELECT p.ID FROM {$wpdb->posts} p
+					 JOIN {$wpdb->postmeta} pm ON p.ID = pm.post_id
+					 WHERE pm.meta_key = '_wcml_duplicate_of_variation' 
+					   AND pm.meta_value = %d 
+					   AND p.post_parent = %d LIMIT 1",
+					$orig_child_id, $tr_id
+				));
+			}
+			if (!$tr_var_id && !empty($orig_var->get_sku())) {
+				$tr_var_id = $wpdb->get_var($wpdb->prepare(
+					"SELECT pm.post_id FROM {$wpdb->postmeta} pm 
+					 JOIN {$wpdb->posts} p ON pm.post_id = p.ID 
+					 WHERE pm.meta_key = '_sku' AND (pm.meta_value = %s OR pm.meta_value = %s)
+					   AND p.post_parent = %d AND p.post_type = 'product_variation' AND p.post_status != 'trash' LIMIT 1",
+					$orig_var->get_sku(), $orig_var->get_sku() . '-' . strtoupper($lang), $tr_id
+				));
+			}
+
+			// Fallback: If WCML did not create the variation, create it now via WooCommerce
+			if (!$tr_var_id) {
+				$new_var = new WC_Product_Variation();
+				$new_var->set_parent_id($tr_id);
+				$new_var->set_status('publish');
+				$tr_var_id = $new_var->save();
+			}
+
+			if ($tr_var_id) {
+				// Exact same SKU as FR variation (no -EN suffix)
+				$orig_sku = $orig_var->get_sku();
+				if (!empty($orig_sku)) {
+					update_post_meta($tr_var_id, '_sku', $orig_sku);
+				}
+
+				// Status publish
+				$wpdb->update($wpdb->posts, ['post_status' => 'publish'], ['ID' => $tr_var_id]);
+
+				// Ensure variation attribute values are set in postmeta
+				$orig_metas = get_post_meta($orig_child_id);
+				foreach ($orig_metas as $mk => $mv) {
+					if (strpos($mk, 'attribute_') === 0 && !empty($mv[0])) {
+						$current_val = get_post_meta($tr_var_id, $mk, true);
+						if (empty($current_val)) {
+							$val = $mv[0];
+							$tax_name = substr($mk, 10);
+							if (taxonomy_exists($tax_name)) {
+								$term = get_term_by('slug', $val, $tax_name) ?: get_term_by('name', $val, $tax_name);
+								if ($term && !is_wp_error($term)) {
+									$tr_term_id = apply_filters('wpml_object_id', $term->term_id, $tax_name, false, $lang);
+									if ($tr_term_id && (int)$tr_term_id !== (int)$term->term_id) {
+										$tr_term = get_term($tr_term_id, $tax_name);
+										if ($tr_term && !is_wp_error($tr_term)) {
+											$val = $tr_term->slug;
+										}
+									} else {
+										$val = $term->slug;
+									}
+								}
+							}
+							update_post_meta($tr_var_id, $mk, $val);
+						}
+					}
+				}
+
+				// Translated description if available
+				$var_desc_en = get_post_meta($orig_child_id, '_mjf_description_en', true);
+				if (!empty($var_desc_en)) {
+					update_post_meta($tr_var_id, '_variation_description', $var_desc_en);
+				}
+
+				// Custom meta (FedEx, etc.)
+				$fedex_keys = [
+					'_wf_hs_code',
+					'_ph_commodity_description',
+					'_wf_freight_class',
+					'_ph_fedex_signature_option',
+					'_ph_manufacture_country',
+					'_wf_manufacture_country',
+					'_wf_fedex_custom_declared_value',
+				];
+				foreach ($fedex_keys as $fk) {
+					$fval = get_post_meta($orig_child_id, $fk, true);
+					if ($fval !== '') {
+						update_post_meta($tr_var_id, $fk, $fval);
+					}
+				}
+
+				update_post_meta($tr_var_id, '_wcml_duplicate_of_variation', $orig_child_id);
+
+				if (isset($sitepress)) {
+					$trid = $sitepress->get_element_trid($orig_child_id, 'post_product_variation');
+					if (!$trid) {
+						$sitepress->set_element_language_details($orig_child_id, 'post_product_variation', null, $default_lang);
+						$trid = $sitepress->get_element_trid($orig_child_id, 'post_product_variation');
+					}
+					$sitepress->set_element_language_details($tr_var_id, 'post_product_variation', $trid, $lang, $default_lang);
+				}
+
+				clean_post_cache($tr_var_id);
+				wp_cache_delete($tr_var_id, 'post_meta');
+				wc_delete_product_transients($tr_var_id);
+			}
+		}
+
+		remove_filter('wcml_product_synchronization_on_save_is_valid_context', '__return_true', 9999);
+		remove_filter('wc_product_has_unique_sku', '__return_false', 9999);
+
+		// Re-sync parent variable products cache, price ranges, and lookup tables
+		$tr_prod = wc_get_product($tr_id);
+		if ($tr_prod) {
+			$tr_prod->save();
+		}
+		WC_Product_Variable::sync($tr_id);
+		wc_delete_product_transients($tr_id);
+		clean_post_cache($tr_id);
+
+		WC_Product_Variable::sync($orig_id);
+		wc_delete_product_transients($orig_id);
+		clean_post_cache($orig_id);
+
+		if (function_exists('wc_update_product_lookup_tables')) {
+			wc_update_product_lookup_tables($tr_id);
+			wc_update_product_lookup_tables($orig_id);
+		}
+		$wcmlDataStore = wcml_product_data_store_cpt();
+		if ($wcmlDataStore && method_exists($wcmlDataStore, 'update_lookup_table_data')) {
+			$wcmlDataStore->update_lookup_table_data($tr_id);
+		}
+
+		// Refresh sync status for all variation rows in the queue
+		$orig_sku = $orig_prod->get_sku();
+		if (!empty($orig_sku)) {
+			$like_parent = '%"parent_sku":"' . $wpdb->esc_like($orig_sku) . '"%';
+			$child_rows = $wpdb->get_results($wpdb->prepare(
+				"SELECT id, product_id, diff_data FROM {$this->table_name} WHERE diff_data LIKE %s",
+				$like_parent
+			));
+			if (!empty($child_rows)) {
+				$mapping = $this->get_hardcoded_mapping();
+				foreach ($child_rows as $c_row) {
+					$c_dd = json_decode($c_row->diff_data, true);
+					$c_raw = $c_dd['raw'] ?? [];
+					$c_pid = $c_row->product_id ? (int)$c_row->product_id : wc_get_product_id_by_sku($c_raw[$mapping['sku'] ?? 'UGS'] ?? '');
+					if ($c_pid) {
+						$c_new_diff = $this->compare_item($c_pid, $c_raw, $mapping, 'variation');
+						$c_status = empty($c_new_diff) ? 'synced' : 'pending';
+						$wpdb->update($this->table_name, [
+							'product_id' => $c_pid,
+							'status'     => $c_status,
+							'diff_data'  => wp_json_encode([
+								'type'       => 'variation',
+								'parent_sku' => $orig_sku,
+								'raw'        => $c_raw,
+								'diff'       => $c_new_diff
+							])
+						], ['id' => $c_row->id]);
+					}
+				}
 			}
 		}
 	}
@@ -893,12 +1305,31 @@ class MJF_GSheet_Product_Importer
 	 */
 	private function translate_or_create_term($term_id, $taxonomy, $lang = 'en')
 	{
-		// 1. Check if translation already exists
+		// 1. Check if translation already exists via WPML
 		$translated_term_id = apply_filters('wpml_object_id', $term_id, $taxonomy, false, $lang);
-		if ($translated_term_id) {
+		if ($translated_term_id && (int)$translated_term_id !== (int)$term_id) {
 			return (int) $translated_term_id;
 		}
 
+		// 2. Only product_shipping_class should have auto-created translated terms if missing in WPML.
+		// For product attribute taxonomies (pa_*), if the taxonomy is not translatable or has no translation in WPML,
+		// terms (such as sizes 30/40, 70/100, weights, codes) MUST be shared across languages, NEVER duplicated with '-en' slugs.
+		if ($taxonomy !== 'product_shipping_class') {
+			global $woocommerce_wpml, $sitepress;
+			$is_translatable = false;
+			if (isset($woocommerce_wpml) && isset($woocommerce_wpml->terms) && method_exists($woocommerce_wpml->terms, 'is_translatable_wc_taxonomy')) {
+				$is_translatable = $woocommerce_wpml->terms->is_translatable_wc_taxonomy($taxonomy);
+			} elseif (isset($sitepress) && method_exists($sitepress, 'is_translated_taxonomy')) {
+				$is_translatable = $sitepress->is_translated_taxonomy($taxonomy);
+			}
+
+			// If attribute taxonomy is not translatable in WPML, or if no manual translation was defined in WPML, use original term
+			if (!$is_translatable || empty($translated_term_id)) {
+				return (int) $term_id;
+			}
+		}
+
+		// 3. For taxonomies that need auto-creation (e.g. shipping class), proceed with creation
 		global $sitepress;
 		$original_lang = null;
 		if (isset($sitepress)) {
@@ -907,7 +1338,7 @@ class MJF_GSheet_Product_Importer
 			$sitepress->switch_lang('fr');
 		}
 
-		// 2. If it does not exist, get original term details
+		// Get original term details
 		$original_term = get_term($term_id, $taxonomy);
 		if (!$original_term || is_wp_error($original_term)) {
 			if (isset($sitepress) && $original_lang) {
@@ -925,7 +1356,7 @@ class MJF_GSheet_Product_Importer
 			$sitepress->switch_lang($lang);
 		}
 
-		// 3. Create the translated term
+		// Create the translated term
 		$new_term = wp_insert_term($term_name, $taxonomy, [
 			'slug' => $translated_slug
 		]);
@@ -943,7 +1374,7 @@ class MJF_GSheet_Product_Importer
 			$translated_term_id = $new_term['term_id'];
 		}
 
-		// 4. Link the new term to the original term in WPML
+		// Link the new term to the original term in WPML
 		$trid = apply_filters('wpml_element_trid', null, $term_id, 'tax_' . $taxonomy);
 		if ($trid) {
 			do_action('wpml_set_element_language_details', [
@@ -997,7 +1428,7 @@ class MJF_GSheet_Product_Importer
 		];
 	}
 
-	private function compare_item($product_id, $raw_item, $mapping, $type = 'simple', $precalc_attributes = [])
+	public function compare_item($product_id, $raw_item, $mapping, $type = 'simple', $precalc_attributes = [])
 	{
 		$diff = [];
 		if (!$product_id) {
@@ -1828,6 +2259,26 @@ class MJF_GSheet_Product_Importer
 				return;
 			}
 
+			// Live check: if translation already exists in WPML, don't show "wpml_missing"
+			$pid = $item->product_id ?: wc_get_product_id_by_sku($item->sku);
+			if ($pid && isset($diffs['wpml_missing'])) {
+				$check_type = ($type === 'variation') ? 'post_product_variation' : 'product';
+				$tr_exists = apply_filters('wpml_object_id', $pid, $check_type, false, 'en');
+				if (!$tr_exists && $type === 'variation') {
+					$tr_exists = apply_filters('wpml_object_id', $pid, 'product_variation', false, 'en');
+					if (!$tr_exists) {
+						global $wpdb;
+						$tr_exists = $wpdb->get_var($wpdb->prepare(
+							"SELECT post_id FROM {$wpdb->postmeta} WHERE meta_key = '_wcml_duplicate_of_variation' AND meta_value = %d LIMIT 1",
+							$pid
+						));
+					}
+				}
+				if ($tr_exists && (int)$tr_exists !== (int)$pid) {
+					unset($diffs['wpml_missing']);
+				}
+			}
+
 			if (isset($diffs['wpml_missing'])) {
 				echo '<div class="mjf-translation-panel" style="padding:15px; border:1px solid #ccd0d4; background:#f0f6fb; margin-bottom:15px;">';
 				echo '<h4 style="margin:0 0 10px; color:#2271b1;"><span class="dashicons dashicons-translation" style="color:#2271b1;"></span> Traduction EN manquante</h4>';
@@ -2071,9 +2522,23 @@ class MJF_GSheet_Product_Importer
 						$missing_var_id = 0;
 						foreach ($group['variations'] as $var) {
 							if ($var->status === 'translation_missing') {
-								$has_missing_translations = true;
-								$missing_var_id = $var->id;
-								break;
+								$v_pid = $var->product_id ?: wc_get_product_id_by_sku($var->sku);
+								$v_tr_exists = false;
+								if ($v_pid) {
+									$v_tr_exists = apply_filters('wpml_object_id', $v_pid, 'post_product_variation', false, 'en') ?: apply_filters('wpml_object_id', $v_pid, 'product_variation', false, 'en');
+									if (!$v_tr_exists) {
+										global $wpdb;
+										$v_tr_exists = $wpdb->get_var($wpdb->prepare(
+											"SELECT post_id FROM {$wpdb->postmeta} WHERE meta_key = '_wcml_duplicate_of_variation' AND meta_value = %d LIMIT 1",
+											$v_pid
+										));
+									}
+								}
+								if (!$v_tr_exists || (int)$v_tr_exists === (int)$v_pid) {
+									$has_missing_translations = true;
+									$missing_var_id = $var->id;
+									break;
+								}
 							}
 						}
 
@@ -2397,20 +2862,58 @@ class MJF_GSheet_Product_Importer
 					$this->set_product_shipping_class($variation, $shipping_class);
 				}
 
+				// If parent variable product has the exact same SKU as this variation, clear parent's SKU to prevent duplicate warning
+				$parent_product = wc_get_product($parent_id);
+				if ($parent_product && $parent_product->get_sku() === $sku) {
+					$parent_product->set_sku('');
+					$parent_product->save();
+				}
+
 				$new_id = $variation->save();
+
+				// Allow WCML to synchronize in AJAX context
+				add_filter('wcml_product_synchronization_on_save_is_valid_context', '__return_true');
 
 				// Trigger WPML variation sync
 				global $woocommerce_wpml;
 				if (isset($woocommerce_wpml) && isset($woocommerce_wpml->sync_variations_data)) {
-					$woocommerce_wpml->sync_variations_data->sync_product_variations_action($parent_id);
+					if (method_exists($woocommerce_wpml->sync_variations_data, 'sync_product_variations_action')) {
+						$woocommerce_wpml->sync_variations_data->sync_product_variations_action($parent_id);
+					}
 				}
+
 				// Force parent to rebuild children cache
-				$parent_product = wc_get_product($parent_id);
-				if ($parent_product) $parent_product->save();
+				if ($parent_product) {
+					WC_Product_Variable::sync($parent_id);
+					clean_post_cache($parent_id);
+					$parent_product->save();
+
+					// If translated EN parent exists, sync variations to it immediately
+					$tr_parent_id = apply_filters('wpml_object_id', $parent_id, 'product', false, 'en');
+					if ($tr_parent_id && (int)$tr_parent_id !== (int)$parent_id) {
+						$tr_parent_product = wc_get_product($tr_parent_id);
+						if ($tr_parent_product) {
+							$this->sync_variable_product_variations($parent_product, $tr_parent_product, 'en');
+						}
+					}
+				}
 			} elseif ($type_raw === 'variable') {
 				$product = new WC_Product_Variable();
 				$product->set_name($title);
-				$product->set_sku($sku);
+
+				// Prevent assigning parent variable SKU if a variation already uses this SKU
+				if (!empty($sku)) {
+					$existing_sku_id = wc_get_product_id_by_sku($sku);
+					if ($existing_sku_id) {
+						$existing_prod = wc_get_product($existing_sku_id);
+						if ($existing_prod && $existing_prod->is_type('variation')) {
+							$sku = '';
+						}
+					}
+				}
+				if (!empty($sku)) {
+					$product->set_sku($sku);
+				}
 				$product->set_status($wp_status);
 				if (!empty($description)) $product->set_description($description);
 				if (!empty($short_desc)) $product->set_short_description($short_desc);
@@ -2572,157 +3075,145 @@ class MJF_GSheet_Product_Importer
 		$item = $wpdb->get_row($wpdb->prepare("SELECT * FROM {$this->table_name} WHERE id = %d", $id));
 		if (!$item) wp_send_json_error('Item not found in queue.');
 
-		$diff_data = json_decode($item->diff_data, true);
-		$raw = $diff_data['raw'] ?? [];
-		$mapping = $this->get_hardcoded_mapping();
-		$sku = $item->sku;
+		try {
+			$diff_data = json_decode($item->diff_data, true);
+			$raw = $diff_data['raw'] ?? [];
+			$mapping = $this->get_hardcoded_mapping();
+			$sku = $item->sku;
 
-		MJF_GSheet_Logger::info(
-			sprintf(__('Creating / syncing English translation for SKU %s...', 'mjf-gsheet-importer'), $sku),
-			'create_translation',
-			['sku' => $sku, 'product_id' => $item->product_id]
-		);
+			MJF_GSheet_Logger::info(
+				sprintf(__('Creating / syncing English translation for SKU %s...', 'mjf-gsheet-importer'), $sku),
+				'create_translation',
+				['sku' => $sku, 'product_id' => $item->product_id]
+			);
 
-		$product_id = $item->product_id;
-		if (!$product_id) {
-			$product_id = wc_get_product_id_by_sku($sku);
-		}
-		if (!$product_id) {
-			MJF_GSheet_Logger::error(sprintf(__('Translation for SKU %s failed: original product (FR) not found in WooCommerce.', 'mjf-gsheet-importer'), $sku), 'create_translation');
-			wp_send_json_error('Original product (FR) not found.');
-		}
-
-		$title_en = trim($raw[$mapping['title_en'] ?? 'Nom du produit EN'] ?? '');
-		$type = $diff_data['type'] ?? 'simple';
-
-		if ($type === 'variation') {
-			$parent_sku = $diff_data['parent_sku'] ?? '';
-			if (!$parent_sku) {
-				MJF_GSheet_Logger::error(sprintf(__('Variation translation for SKU %s failed: parent SKU missing.', 'mjf-gsheet-importer'), $sku), 'create_translation');
-				wp_send_json_error('Parent SKU not found for this variation.');
+			$product_id = $item->product_id;
+			if (!$product_id) {
+				$product_id = wc_get_product_id_by_sku($sku);
+			}
+			if (!$product_id) {
+				MJF_GSheet_Logger::error(sprintf(__('Translation for SKU %s failed: original product (FR) not found in WooCommerce.', 'mjf-gsheet-importer'), $sku), 'create_translation');
+				wp_send_json_error('Original product (FR) not found.');
 			}
 
-			$parent_id = 0;
-			$parent_row = $wpdb->get_row($wpdb->prepare("SELECT product_id FROM {$this->table_name} WHERE sku = %s", $parent_sku));
-			if ($parent_row && $parent_row->product_id) {
-				$parent_id = intval($parent_row->product_id);
-			}
-			if (!$parent_id) {
-				$parent_id = wc_get_product_id_by_sku($parent_sku);
-			}
-			if (!$parent_id) {
-				MJF_GSheet_Logger::error(sprintf(__('Variation translation for SKU %s failed: parent product not found.', 'mjf-gsheet-importer'), $sku), 'create_translation');
-				wp_send_json_error('Parent product not found.');
-			}
+			$title_en = trim($raw[$mapping['title_en'] ?? 'Nom du produit EN'] ?? '');
+			$type = $diff_data['type'] ?? 'simple';
 
-			// Ensure the parent variable product has an English translation first
-			$tr_parent_id = apply_filters('wpml_object_id', $parent_id, 'product', false, 'en');
-			if (!$tr_parent_id || $tr_parent_id == $parent_id) {
-				$parent_entry = $wpdb->get_row($wpdb->prepare("SELECT diff_data FROM {$this->table_name} WHERE sku = %s", $parent_sku));
-				$parent_raw = [];
-				if ($parent_entry) {
-					$parent_dd = json_decode($parent_entry->diff_data, true);
-					$parent_raw = $parent_dd['raw'] ?? [];
+			if ($type === 'variation') {
+				$parent_sku = $diff_data['parent_sku'] ?? '';
+				if (!$parent_sku) {
+					MJF_GSheet_Logger::error(sprintf(__('Variation translation for SKU %s failed: parent SKU missing.', 'mjf-gsheet-importer'), $sku), 'create_translation');
+					wp_send_json_error('Parent SKU not found for this variation.');
 				}
-				$formatted_parent = $this->format_raw_for_upsert($parent_raw);
-				$tr_parent_id = $this->upsert_translation($parent_id, $formatted_parent, 'en');
-			}
 
-			// Allow WCML to synchronize in AJAX context
-			add_filter('wcml_product_synchronization_on_save_is_valid_context', '__return_true');
-
-			global $woocommerce_wpml;
-			if (isset($woocommerce_wpml) && isset($woocommerce_wpml->sync_variations_data)) {
-				if ($tr_parent_id && method_exists($woocommerce_wpml->sync_variations_data, 'sync_product_variations')) {
-					$woocommerce_wpml->sync_variations_data->sync_product_variations($parent_id, $tr_parent_id, 'en');
+				$parent_id = 0;
+				$parent_row = $wpdb->get_row($wpdb->prepare("SELECT product_id FROM {$this->table_name} WHERE sku = %s", $parent_sku));
+				if ($parent_row && $parent_row->product_id) {
+					$parent_id = intval($parent_row->product_id);
 				}
-				if (method_exists($woocommerce_wpml->sync_variations_data, 'sync_product_variations_action')) {
-					$woocommerce_wpml->sync_variations_data->sync_product_variations_action($parent_id);
+				if (!$parent_id) {
+					$parent_id = wc_get_product_id_by_sku($parent_sku);
 				}
+				if (!$parent_id) {
+					MJF_GSheet_Logger::error(sprintf(__('Variation translation for SKU %s failed: parent product not found.', 'mjf-gsheet-importer'), $sku), 'create_translation');
+					wp_send_json_error('Parent product not found.');
+				}
+
+				// Ensure the parent variable product has an English translation first
+				$tr_parent_id = apply_filters('wpml_object_id', $parent_id, 'product', false, 'en');
+				if (!$tr_parent_id || $tr_parent_id == $parent_id) {
+					$parent_entry = $wpdb->get_row($wpdb->prepare("SELECT diff_data FROM {$this->table_name} WHERE sku = %s", $parent_sku));
+					$parent_raw = [];
+					if ($parent_entry) {
+						$parent_dd = json_decode($parent_entry->diff_data, true);
+						$parent_raw = $parent_dd['raw'] ?? [];
+					}
+					$formatted_parent = $this->format_raw_for_upsert($parent_raw);
+					$tr_parent_id = $this->upsert_translation($parent_id, $formatted_parent, 'en');
+				}
+
+				if (!$tr_parent_id || $tr_parent_id == $parent_id) {
+					$tr_parent_id = apply_filters('wpml_object_id', $parent_id, 'product', false, 'en');
+				}
+
+				// Synchronize all variations of the parent to the translated variable product
+				if ($tr_parent_id && (int)$tr_parent_id !== (int)$parent_id) {
+					$parent_prod = wc_get_product($parent_id);
+					$tr_parent_prod = wc_get_product($tr_parent_id);
+					if ($parent_prod && $tr_parent_prod) {
+						$this->sync_attributes_to_translation($parent_prod, $tr_parent_prod, 'en');
+						$this->sync_variable_product_variations($parent_prod, $tr_parent_prod, 'en');
+					}
+				}
+			} else {
+				if (empty($title_en)) {
+					MJF_GSheet_Logger::error(sprintf(__('Translation for SKU %s failed: English title missing in Google Sheet.', 'mjf-gsheet-importer'), $sku), 'create_translation');
+					wp_send_json_error('English title is required.');
+				}
+				$formatted_item = $this->format_raw_for_upsert($raw);
+				$this->upsert_translation($product_id, $formatted_item, 'en');
 			}
 
-			// Check if translated variation exists or needs manual creation
-			$translated_var_id = apply_filters('wpml_object_id', $product_id, 'product_variation', false, 'en');
-			if (!$translated_var_id || $translated_var_id == $product_id) {
-				$translated_var_id = apply_filters('wpml_object_id', $product_id, 'post_product_variation', false, 'en');
-			}
-			if (!$translated_var_id || $translated_var_id == $product_id) {
-				$translated_var_id = $wpdb->get_var($wpdb->prepare(
-					"SELECT t.element_id FROM {$wpdb->prefix}icl_translations s
-					 JOIN {$wpdb->prefix}icl_translations t ON s.trid = t.trid AND t.language_code = 'en'
-					 WHERE s.element_id = %d AND s.element_type = 'post_product_variation' LIMIT 1",
-					$product_id
+			// Refresh this item status
+			$new_diff = $this->compare_item($product_id, $raw, $mapping, $type);
+			$status = empty($new_diff) ? 'synced' : 'pending';
+
+			$wpdb->update($this->table_name, [
+				'status' => $status,
+				'diff_data' => wp_json_encode([
+					'type' => $diff_data['type'] ?? 'simple',
+					'parent_sku' => $diff_data['parent_sku'] ?? '',
+					'raw' => $raw,
+					'diff' => $new_diff
+				])
+			], ['id' => $id]);
+
+			// Also refresh all sibling variation rows in the queue so they no longer show "Traduction manquante"
+			$parent_sku_to_sync = ($type === 'variation') ? ($diff_data['parent_sku'] ?? '') : $sku;
+			if (!empty($parent_sku_to_sync)) {
+				$like_parent = '%"parent_sku":"' . $wpdb->esc_like($parent_sku_to_sync) . '"%';
+				$child_rows = $wpdb->get_results($wpdb->prepare(
+					"SELECT id, product_id, diff_data FROM {$this->table_name} WHERE diff_data LIKE %s",
+					$like_parent
 				));
-			}
-			if (!$translated_var_id) {
-				$wcml_dup = $wpdb->get_var($wpdb->prepare(
-					"SELECT post_id FROM {$wpdb->postmeta} WHERE meta_key = '_wcml_duplicate_of_variation' AND meta_value = %d LIMIT 1",
-					$product_id
-				));
-				if ($wcml_dup) {
-					$translated_var_id = (int)$wcml_dup;
-				}
-			}
-
-			// Failsafe: create the translated variation post directly under $tr_parent_id
-			if (!$translated_var_id && $tr_parent_id) {
-				$orig_var = wc_get_product($product_id);
-				if ($orig_var) {
-					$new_tr_var = new WC_Product_Variation();
-					$new_tr_var->set_parent_id($tr_parent_id);
-					$new_tr_var->set_sku($orig_var->get_sku() . '-EN');
-					$new_tr_var->set_status('publish');
-					$new_tr_var->set_regular_price($orig_var->get_regular_price());
-					$new_tr_var->set_price($orig_var->get_price());
-					$new_tr_var->set_manage_stock($orig_var->get_manage_stock());
-					$new_tr_var->set_stock_quantity($orig_var->get_stock_quantity());
-					$new_tr_var->set_weight($orig_var->get_weight());
-					$new_tr_var->set_attributes($orig_var->get_attributes());
-					$saved_id = $new_tr_var->save();
-					if ($saved_id) {
-						update_post_meta($saved_id, '_wcml_duplicate_of_variation', $product_id);
-						global $sitepress;
-						if (isset($sitepress)) {
-							$trid = $sitepress->get_element_trid($product_id, 'post_product_variation');
-							if (!$trid) {
-								$sitepress->set_element_language_details($product_id, 'post_product_variation', null, 'fr');
-								$trid = $sitepress->get_element_trid($product_id, 'post_product_variation');
-							}
-							$sitepress->set_element_language_details($saved_id, 'post_product_variation', $trid, 'en', 'fr');
+				if (!empty($child_rows)) {
+					foreach ($child_rows as $c_row) {
+						$c_dd = json_decode($c_row->diff_data, true);
+						$c_raw = $c_dd['raw'] ?? [];
+						$c_pid = $c_row->product_id ? (int)$c_row->product_id : wc_get_product_id_by_sku($c_raw[$mapping['sku'] ?? 'UGS'] ?? '');
+						if ($c_pid) {
+							$c_new_diff = $this->compare_item($c_pid, $c_raw, $mapping, 'variation');
+							$c_status = empty($c_new_diff) ? 'synced' : 'pending';
+							$wpdb->update($this->table_name, [
+								'product_id' => $c_pid,
+								'status'     => $c_status,
+								'diff_data'  => wp_json_encode([
+									'type'       => 'variation',
+									'parent_sku' => $parent_sku_to_sync,
+									'raw'        => $c_raw,
+									'diff'       => $c_new_diff
+								])
+							], ['id' => $c_row->id]);
 						}
 					}
 				}
 			}
-		} else {
-			if (empty($title_en)) {
-				MJF_GSheet_Logger::error(sprintf(__('Translation for SKU %s failed: English title missing in Google Sheet.', 'mjf-gsheet-importer'), $sku), 'create_translation');
-				wp_send_json_error('English title is required.');
-			}
-			$formatted_item = $this->format_raw_for_upsert($raw);
-			$this->upsert_translation($product_id, $formatted_item, 'en');
+
+			MJF_GSheet_Logger::success(
+				sprintf(__('English translation created / synced successfully for SKU %s (FR ID: %d).', 'mjf-gsheet-importer'), $sku, $product_id),
+				'create_translation',
+				['sku' => $sku, 'product_id' => $product_id]
+			);
+
+			wp_send_json_success('English translation created successfully.');
+		} catch (\Throwable $e) {
+			MJF_GSheet_Logger::error(
+				sprintf(__('Exception while creating translation for SKU %s: %s', 'mjf-gsheet-importer'), $sku ?? '', $e->getMessage()),
+				'create_translation',
+				['exception' => $e->getMessage()]
+			);
+			wp_send_json_error('Exception : ' . $e->getMessage());
 		}
-
-		// Refresh this item status
-		$new_diff = $this->compare_item($product_id, $raw, $mapping, $type);
-		$status = empty($new_diff) ? 'synced' : 'pending';
-
-		$wpdb->update($this->table_name, [
-			'status' => $status,
-			'diff_data' => wp_json_encode([
-				'type' => $diff_data['type'] ?? 'simple',
-				'parent_sku' => $diff_data['parent_sku'] ?? '',
-				'raw' => $raw,
-				'diff' => $new_diff
-			])
-		], ['id' => $id]);
-
-		MJF_GSheet_Logger::success(
-			sprintf(__('English translation created / synced successfully for SKU %s (FR ID: %d).', 'mjf-gsheet-importer'), $sku, $product_id),
-			'create_translation',
-			['sku' => $sku, 'product_id' => $product_id]
-		);
-
-		wp_send_json_success('English translation created successfully.');
 	}
 
 	public function ajax_update_sync_direction()

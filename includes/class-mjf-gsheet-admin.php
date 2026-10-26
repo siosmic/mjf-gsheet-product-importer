@@ -526,7 +526,8 @@ class MJF_GSheet_Admin
 									loadComparisonPage(1);
 								}, 1500);
 							} else {
-								alert('Erreur : ' + response.data);
+								var msg = (response && response.data) ? response.data : (typeof response === 'string' ? response : 'Erreur inconnue');
+								alert('Erreur : ' + msg);
 								$btn.prop('disabled', false).text('Créer la traduction Anglaise');
 							}
 						}).fail(function() {
